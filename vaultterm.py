@@ -136,8 +136,11 @@ def inf(msg: str):
 
 
 def pause():
-    console.print(f"  [{C_DIM}]press ENTER to continue...[/{C_DIM}]", end="")
-    input()
+    try:
+        console.print(f"  [{C_DIM}]press ENTER to continue...[/{C_DIM}]", end="")
+        input()
+    except (KeyboardInterrupt, EOFError):
+        console.print()  # newline after the ^C echo
 
 
 def ask_pw(prompt: str = "password") -> str:
@@ -387,6 +390,8 @@ class DB:
                 value TEXT NOT NULL
             );
             INSERT OR REPLACE INTO settings (key,value) VALUES ('schema_version','{SCHEMA_VERSION}');
+            INSERT OR IGNORE  INTO settings (key,value) VALUES ('expiry_days',   '{EXPIRY_DAYS}');
+            INSERT OR IGNORE  INTO settings (key,value) VALUES ('auto_lock_minutes', '10');
 
             CREATE TABLE IF NOT EXISTS entries (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -434,7 +439,7 @@ class DB:
             "updated_at": d["updated_at"],
             "age": age_days(d["updated_at"]),
         }
-        out["expired"] = out["age"] >= EXPIRY_DAYS
+        out["expired"] = out["age"] >= self.expiry_days
         return out
 
     def _row_full(self, row: sqlite3.Row) -> Dict:
@@ -463,7 +468,18 @@ class DB:
 
     def search_summaries(self, query: str) -> List[Dict]:
         q = query.lower().strip()
-        return [e for e in self.get_all_summaries() if q in e["name"].lower() or q in e["url"].lower() or q in e["login"].lower()]
+        matches = []
+        rows = self._db.execute("SELECT * FROM entries ORDER BY id").fetchall()
+        for row in rows:
+            s = self._row_summary(row)
+            if q in s["name"].lower() or q in s["url"].lower() or q in s["login"].lower():
+                matches.append(s)
+            elif dict(row).get("notes"):
+                # Only decrypt notes when the entry didn't already match on cheaper fields
+                notes = self._safe_dec(dict(row)["notes"], "")
+                if q in notes.lower():
+                    matches.append(s)
+        return sorted(matches, key=lambda x: x["name"].lower())
 
     def duplicate_hits(self, name: str, url: str, login: str) -> List[Dict]:
         hits = []
@@ -527,6 +543,31 @@ class DB:
         self._log("PURGE", eid)
         self._db.commit()
 
+    def setting(self, key: str, default: str = "") -> str:
+        r = self._db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        return r[0] if r else default
+
+    def set_setting(self, key: str, value: str):
+        self._db.execute(
+            "INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)", (key, value)
+        )
+        self._db.commit()
+
+    @property
+    def expiry_days(self) -> int:
+        try:
+            return max(1, int(self.setting("expiry_days", str(EXPIRY_DAYS))))
+        except Exception:
+            return EXPIRY_DAYS
+
+    @property
+    def auto_lock_seconds(self) -> int:
+        try:
+            minutes = int(self.setting("auto_lock_minutes", "10"))
+            return minutes * 60
+        except Exception:
+            return AUTO_LOCK_SECONDS
+
     def get_log(self, n: int = 80) -> List[Dict]:
         rows = self._db.execute("SELECT * FROM log ORDER BY ts DESC LIMIT ?", (n,)).fetchall()
         return [dict(r) for r in rows]
@@ -567,7 +608,7 @@ class DB:
                 sc, _, _ = strength(full["password"])
                 if sc < 50:
                     result["weak"] += 1
-                if age_days(full["updated_at"]) >= EXPIRY_DAYS:
+                if age_days(full["updated_at"]) >= self.expiry_days:
                     result["expired"] += 1
                 if full["password_hash"] in seen_hashes:
                     result["reused_hashes"] += 1
@@ -659,7 +700,7 @@ class VaultTerm:
         self.last_activity = time.monotonic()
 
     def check_timeout(self):
-        if time.monotonic() - self.last_activity > AUTO_LOCK_SECONDS:
+        if self.db and time.monotonic() - self.last_activity > self.db.auto_lock_seconds:
             if self.db:
                 self.db.close()
             clr()
@@ -740,7 +781,7 @@ class VaultTerm:
         if not expired:
             return
         clr(); banner()
-        console.print(f"  [{C_WARN}]!! EXPIRY ALERT !! {len(expired)} password(s) not rotated in {EXPIRY_DAYS}+ days.[/{C_WARN}]\n")
+        console.print(f"  [{C_WARN}]!! EXPIRY ALERT !! {len(expired)} password(s) not rotated in {self.db.expiry_days}+ days.[/{C_WARN}]\n")
         console.print(self._entry_table(expired))
         pause()
 
@@ -764,25 +805,39 @@ class VaultTerm:
 
     def _menu(self):
         items = [
-            ("1", "LIST", "display vault entries"), ("2", "SEARCH", "query by name/url/login"),
-            ("3", "INJECT", "add a new entry"), ("4", "MODIFY", "edit an entry"),
-            ("5", "PURGE", "delete an entry"), ("6", "GENERATE", "password generator"),
-            ("7", "LOG", "view audit trail"), ("8", "REKEY", "change master password"),
-            ("9", "CLONE", "encrypted vault backup"), ("10", "TOTP", "generate TOTP code"),
-            ("11", "HEALTH", "vault health check"), ("0", "EJECT", "lock and exit"),
+            ("1", "LIST",     "display vault entries"),
+            ("2", "SEARCH",   "query by name/url/login/notes"),
+            ("3", "INJECT",   "add a new entry"),
+            ("4", "MODIFY",   "edit an entry"),
+            ("5", "PURGE",    "delete an entry"),
+            ("6", "GENERATE", "password generator"),
+            ("7", "LOG",      "view audit trail"),
+            ("8", "REKEY",    "change master password"),
+            ("9", "CLONE",    "encrypted vault backup"),
+            ("10", "TOTP",    "live TOTP code display"),
+            ("11", "HEALTH",  "vault health check"),
+            ("12", "SETTINGS","expiry days, auto-lock timeout"),
+            ("0",  "EJECT",   "lock and exit"),
         ]
         t = Table(box=box.SIMPLE, show_header=False, padding=(0, 1))
         t.add_column("K", width=4); t.add_column("CMD", width=10); t.add_column("DESC")
         for key, cmd, desc in items:
             t.add_row(f"[{C_KEY}][{key}][/{C_KEY}]", f"[{C_HEAD}]{cmd}[/{C_HEAD}]", f"[{C_DIM}]{desc}[/{C_DIM}]")
         console.print(t); console.print()
-        choice = Prompt.ask(f"  [{C_HEAD}]cmd[/{C_HEAD}]", choices=["0","1","2","3","4","5","6","7","8","9","10","11"], show_choices=False)
+        choices = ["0","1","2","3","4","5","6","7","8","9","10","11","12"]
+        choice = Prompt.ask(f"  [{C_HEAD}]cmd[/{C_HEAD}]", choices=choices, show_choices=False)
         clr()
-        {
-            "1": self.cmd_list, "2": self.cmd_search, "3": self.cmd_inject, "4": self.cmd_modify,
-            "5": self.cmd_purge, "6": self.cmd_generate, "7": self.cmd_log, "8": self.cmd_rekey,
-            "9": self.cmd_clone, "10": self.cmd_totp, "11": self.cmd_health, "0": self.cmd_eject,
-        }[choice]()
+        dispatch = {
+            "1": self.cmd_list,     "2": self.cmd_search,   "3": self.cmd_inject,
+            "4": self.cmd_modify,   "5": self.cmd_purge,    "6": self.cmd_generate,
+            "7": self.cmd_log,      "8": self.cmd_rekey,    "9": self.cmd_clone,
+            "10": self.cmd_totp,    "11": self.cmd_health,  "12": self.cmd_settings,
+            "0": self.cmd_eject,
+        }
+        try:
+            dispatch[choice]()
+        except KeyboardInterrupt:
+            console.print(f"\n  [{C_DIM}]cancelled.[/{C_DIM}]\n")
 
     def _entry_table(self, entries: List[Dict]) -> Table:
         t = Table(box=box.MINIMAL, show_header=True, header_style=f"bold {C_HEAD}", border_style=C_DIM, padding=(0, 2))
@@ -847,7 +902,22 @@ class VaultTerm:
         row("CREATED", local_date(full["created_at"]), C_DIM); row("UPDATED", local_date(full["updated_at"]), C_DIM)
         row("AGE", f"{full['age']} day(s)", C_ERR if full["expired"] else C_DIM)
         if full.get("notes"): row("NOTES", full["notes"], C_DIM)
-        row("TOTP", "configured" if full.get("totp_secret") else "not configured", C_OK if full.get("totp_secret") else C_DIM)
+        if full.get("totp_secret") and pyotp is not None:
+            try:
+                totp_obj  = pyotp.TOTP(full["totp_secret"])
+                remaining = totp_obj.interval - (int(time.time()) % totp_obj.interval)
+                code      = totp_obj.now()
+                code_color = C_ERR if remaining <= 5 else (C_WARN if remaining <= 10 else C_PW)
+                row("TOTP", f"{code}  [{C_DIM}]({remaining}s remaining — use [10] for live display)[/{C_DIM}]", code_color)
+                if remaining <= 5:
+                    next_code = totp_obj.at(time.time() + remaining + 1)
+                    row("TOTP NEXT", next_code, C_WARN)
+            except Exception:
+                row("TOTP", "[invalid secret]", C_ERR)
+        elif full.get("totp_secret"):
+            row("TOTP", "configured", C_OK)
+        else:
+            row("TOTP", "not configured", C_DIM)
         console.print(f"  [{C_DIM}]STRENGTH  [/{C_DIM}]", end=""); console.print(strength_bar(sc), end="")
         console.print(f"  [{color}]{label}[/{color}] ({sc}/100)"); console.print(sep); console.print(); pause()
 
@@ -875,7 +945,7 @@ class VaultTerm:
         url = Prompt.ask(f"  [{C_HEAD}]url[/{C_HEAD}]    [{C_DIM}](optional)[/{C_DIM}]", default="")
         login = Prompt.ask(f"  [{C_HEAD}]login/email[/{C_HEAD}]")
         notes = Prompt.ask(f"  [{C_HEAD}]notes[/{C_HEAD}]  [{C_DIM}](optional)[/{C_DIM}]", default="")
-        totp_secret = Prompt.ask(f"  [{C_HEAD}]totp secret[/{C_HEAD}] [{C_DIM}](optional)[/{C_DIM}]", default="")
+        totp_secret = self._totp_input()
         dupes = self.db.duplicate_hits(name, url, login)
         if dupes:
             warn("possible duplicate entry detected.")
@@ -910,7 +980,7 @@ class VaultTerm:
             "notes": Prompt.ask(f"  [{C_HEAD}]notes[/{C_HEAD}]", default=full.get("notes", "")),
         }
         if Confirm.ask("  edit TOTP secret?", default=False):
-            updates["totp_secret"] = Prompt.ask(f"  [{C_HEAD}]totp secret[/{C_HEAD}]", default=full.get("totp_secret", ""))
+            updates["totp_secret"] = self._totp_input(current=full.get("totp_secret", ""))
         console.print(f"\n  [{C_KEY}][K][/{C_KEY}] keep password   [{C_KEY}][G][/{C_KEY}] generate   [{C_KEY}][M][/{C_KEY}] manual\n")
         mode = Prompt.ask(f"  [{C_HEAD}]password[/{C_HEAD}]", choices=["k","K","g","G","m","M"], show_choices=False).upper()
         if mode == "G": updates["password"] = self._gen_pw(e["id"])
@@ -997,12 +1067,40 @@ class VaultTerm:
             if not Confirm.ask("  generate another?", default=False): break
         pause()
 
+    def _totp_input(self, current: str = "") -> str:
+        """Prompt for a TOTP base32 secret, validate it, and return the cleaned value.
+        Returns empty string if the user skips or enters an invalid secret."""
+        while True:
+            prompt_default = current if current else ""
+            raw = Prompt.ask(
+                f"  [{C_HEAD}]totp secret[/{C_HEAD}] [{C_DIM}](base32 from QR code, ENTER to skip)[/{C_DIM}]",
+                default=prompt_default,
+            ).strip().replace(" ", "").upper()
+
+            if not raw:
+                return ""   # user skipped
+
+            if pyotp is None:
+                warn("pyotp not installed — secret stored without validation.")
+                return raw
+
+            try:
+                totp_obj = pyotp.TOTP(raw)
+                code     = totp_obj.now()
+                ok(f"TOTP validated.  current code: [{C_PW}]{code}[/{C_PW}]")
+                return raw
+            except Exception:
+                err("invalid TOTP secret. must be a valid base32 string.")
+                if not Confirm.ask("  try again?", default=True):
+                    return current   # keep old value unchanged
+
     def cmd_totp(self):
-        banner(); header("TOTP")
+        banner(); header("TOTP -- LIVE CODE")
         entries = [e for e in self.db.get_all_summaries() if e.get("has_totp")]
         if not entries:
             inf("no entries with TOTP configured."); pause(); return
-        console.print(self._entry_table(entries)); console.print(); self._totp_for(entries)
+        console.print(self._entry_table(entries)); console.print()
+        self._totp_for(entries)
 
     def _totp_for(self, entries: List[Dict]):
         if pyotp is None:
@@ -1013,13 +1111,97 @@ class VaultTerm:
         if not full.get("totp_secret"):
             warn("entry has no TOTP secret."); pause(); return
         try:
-            code = pyotp.TOTP(full["totp_secret"]).now()
-            console.print(f"\n  [{C_DIM}]entry[/{C_DIM}]  [{C_DATA}]{full['name']}[/{C_DATA}]")
-            console.print(f"  [{C_DIM}]TOTP [/{C_DIM}]  [{C_PW}]{code}[/{C_PW}]\n")
-            if _CLIP and Confirm.ask("  copy code to clipboard?", default=False):
-                pyperclip.copy(code); _clip_clear(code); ok("code copied.")
+            totp_obj = pyotp.TOTP(full["totp_secret"])
+            totp_obj.now()   # validate secret is usable
         except Exception:
-            err("invalid TOTP secret.")
+            err("invalid TOTP secret stored for this entry."); pause(); return
+
+        self._totp_live(totp_obj, full["name"])
+
+    def _totp_live(self, totp_obj, name: str):
+        """
+        Cross-platform live TOTP display.
+        A background thread watches stdin for Enter; the main thread renders
+        the code + countdown bar every 0.5 s using raw ANSI escapes so that
+        Rich's buffering never gets in the way of the \\r overwrite.
+        """
+        interval = totp_obj.interval   # 30 s for standard TOTP
+
+        # ── background stdin watcher (cross-platform: no select.select) ──────
+        _stop = threading.Event()
+        def _stdin_watcher():
+            try:
+                sys.stdin.readline()
+            except Exception:
+                pass
+            _stop.set()
+        threading.Thread(target=_stdin_watcher, daemon=True).start()
+
+        # ── ANSI codes (work on Linux, macOS, and modern Windows terminals) ──
+        _CYAN  = "\033[96m";  _BOLD  = "\033[1m"
+        _GREEN = "\033[92m";  _YELLOW= "\033[93m"
+        _RED   = "\033[91m";  _DIM   = "\033[2m"
+        _RESET = "\033[0m"
+
+        console.print(
+            f"\n  [{C_DIM}]live TOTP for[/{C_DIM}] [{C_HEAD}]{name}[/{C_HEAD}]"
+            f"  [{C_DIM}]-- press ENTER to exit[/{C_DIM}]\n"
+        )
+
+        BAR_WIDTH = 30
+        last_code = None
+        try:
+            while not _stop.is_set():
+                ts        = int(time.time())
+                remaining = interval - (ts % interval)
+                code      = totp_obj.now()
+
+                # Bar depletes left→right as the window runs out
+                filled = int((remaining / interval) * BAR_WIDTH)
+                bar    = "[" + "#" * filled + "." * (BAR_WIDTH - filled) + "]"
+
+                if remaining <= 5:
+                    bar_col = _RED
+                    try:
+                        next_code  = totp_obj.at(time.time() + remaining + 1)
+                        next_label = f"  {_YELLOW}next: {_BOLD}{next_code}{_RESET}"
+                    except Exception:
+                        next_label = ""
+                elif remaining <= 10:
+                    bar_col    = _YELLOW
+                    next_label = ""
+                else:
+                    bar_col    = _GREEN
+                    next_label = ""
+
+                # Flash the code text whenever it changes
+                code_style = _BOLD + (_RED if remaining <= 5 else _CYAN)
+
+                line = (
+                    f"\r  {code_style}{code}{_RESET}"
+                    f"  {bar_col}{bar}{_RESET}"
+                    f"  {_DIM}{remaining:2d}s{_RESET}"
+                    f"{next_label}   "
+                )
+                sys.stdout.write(line)
+                sys.stdout.flush()
+
+                last_code = code
+                _stop.wait(timeout=0.5)
+
+        except KeyboardInterrupt:
+            _stop.set()
+
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+        console.print()
+
+        # Offer clipboard copy of the last displayed code
+        if last_code and _CLIP:
+            if Confirm.ask(f"  copy [{last_code}] to clipboard?", default=False):
+                pyperclip.copy(last_code)
+                _clip_clear(last_code)
+                ok("code copied.")
         pause()
 
     def cmd_log(self):
@@ -1107,6 +1289,45 @@ class VaultTerm:
         try: return (path.stat().st_mode & 0o777) == expected
         except Exception: return False
 
+    def cmd_settings(self):
+        banner(); header("SETTINGS")
+
+        cur_expiry = self.db.setting("expiry_days",       str(EXPIRY_DAYS))
+        cur_lock   = self.db.setting("auto_lock_minutes", "10")
+
+        console.print(f"  [{C_DIM}]expiry_days       [/{C_DIM}]  [{C_DATA}]{cur_expiry}[/{C_DATA}]"
+                      f"  [{C_DIM}]days before a password is flagged [EXPIRED][/{C_DIM}]")
+        console.print(f"  [{C_DIM}]auto_lock_minutes [/{C_DIM}]  [{C_DATA}]{cur_lock}[/{C_DATA}]"
+                      f"  [{C_DIM}]minutes of inactivity before lock (0 = disabled)[/{C_DIM}]\n")
+
+        new_expiry = Prompt.ask(f"  [{C_HEAD}]expiry_days[/{C_HEAD}]",       default=cur_expiry)
+        new_lock   = Prompt.ask(f"  [{C_HEAD}]auto_lock_minutes[/{C_HEAD}]", default=cur_lock)
+
+        errors = []
+        try:
+            ed = int(new_expiry)
+            if ed < 1: raise ValueError
+        except ValueError:
+            errors.append("expiry_days must be a positive integer.")
+            ed = int(cur_expiry)
+
+        try:
+            lm = int(new_lock)
+            if lm < 0: raise ValueError
+        except ValueError:
+            errors.append("auto_lock_minutes must be 0 or a positive integer.")
+            lm = int(cur_lock)
+
+        for e in errors:
+            err(e)
+
+        if not errors or Confirm.ask("  save valid values anyway?", default=False):
+            self.db.set_setting("expiry_days",       str(ed))
+            self.db.set_setting("auto_lock_minutes", str(lm))
+            ok("settings saved.")
+
+        pause()
+
     def cmd_eject(self):
         if self.db: self.db.close()
         clr(); console.print(); console.print(f"[{C_HEAD}]{'=' * (console.width or 72)}[/{C_HEAD}]")
@@ -1124,3 +1345,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
