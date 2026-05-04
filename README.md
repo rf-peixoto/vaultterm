@@ -229,8 +229,6 @@ The session locks after 10 minutes of inactivity by default. The timeout is conf
 
 ## Known limitations
 
-- **No cloud sync.** Intentional.
-- **No import/export.** Planned.
 - **SSD shredding is not guaranteed.** See deadman note above.
 - **Windows clipboard auto-clear** may not work without additional dependencies.
 - **History is cleared on rekey.** HMAC hashes are key-bound and cannot survive a key change.
@@ -239,4 +237,4 @@ The session locks after 10 minutes of inactivity by default. The timeout is conf
 
 ## License
 
-MIT
+The Unlicense
