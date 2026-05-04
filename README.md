@@ -6,7 +6,8 @@
 =========================================================================
 ```
 
-A terminal password manager built for people who don't trust clouds. All data lives in an encrypted SQLite database on your machine. No sync, no accounts, no telemetry.
+A terminal password manager that keeps everything local and encrypted.
+No cloud, no accounts, no telemetry. One Python file, one SQLite database.
 
 ---
 
@@ -14,33 +15,34 @@ A terminal password manager built for people who don't trust clouds. All data li
 
 | Layer | Choice | Why |
 |---|---|---|
-| Cipher | ChaCha20-Poly1305 | Authenticated encryption. Each field gets a fresh random 12-byte nonce. |
-| KDF | Argon2id (256 MB, t=3, p=2) | Memory-hard. Resists GPU and ASIC brute-force against the master password. |
-| Key split | 64-byte KDF output → `enc_key[:32]` + `hash_key[32:]` | Encryption and HMAC operations never share the same key. |
-| Scope | Field-level encryption | `name`, `url`, `login`, `password`, `notes`, `totp_secret` are each encrypted independently with their own nonce. |
-| AAD | `b"vaultterm-v3"` | Domain-binds every ciphertext. A token from one version can't be replayed into another context. |
-| Password history | HMAC-SHA256 (hash_key) | Old passwords are stored as keyed hashes, not plaintext. Reuse detection without exposing prior passwords. |
-| File permissions | `0700` (vault dir) · `0600` (db, meta, backups) | On Linux and macOS only. Windows is not enforced. |
-| Deadman | Separate Argon2id derivation, separate sentinel | Triggered at login. Shreds vault silently and exits with a fake corruption error. |
+| Cipher | ChaCha20-Poly1305 | Authenticated encryption. Every field gets a fresh 12-byte random nonce on each write. |
+| KDF | Argon2id (256 MB, t=3, p=2) | Memory-hard. Raises the cost of GPU/ASIC brute-force against the master password. |
+| Key split | 64-byte Argon2id output → `enc_key[:32]` + `hash_key[32:]` | Encryption and HMAC operations never share a key. |
+| Scope | Field-level | `name`, `url`, `login`, `password`, `notes`, `totp_secret` each carry their own nonce. |
+| AAD | `b"vaultterm-v3"` | Domain-binds every ciphertext so tokens cannot be replayed across versions or contexts. |
+| Password history | HMAC-SHA256 keyed with `hash_key` | Prior passwords are stored as keyed hashes — reuse detection without exposing plaintext. |
+| File permissions | `0700` (vault dir) · `0600` (db, meta, backups) | Enforced on Linux and macOS. Not enforced on Windows. |
+| Deadman | Independent Argon2id derivation + independent sentinel | Triggers silently at login. Shreds the vault and exits with a fake corruption message. |
 
-Nothing leaves the machine. No network calls are made.
+Nothing leaves the machine.
 
 ---
 
 ## What is stored in plaintext
 
-- Audit log action codes (`ADD`, `EDIT`, `PURGE`, `REKEY`) and entry IDs
-- The `has_totp` flag (0 or 1) per entry, so the list view can show the OTP column without decrypting
-- Timestamps (`created_at`, `updated_at`) in UTC ISO format
+- Audit log: action codes (`ADD`, `EDIT`, `PURGE`, `REKEY`) and entry IDs only
+- The `has_totp` flag (0 or 1) per entry — the list view needs it to show the 2FA column without decrypting
+- Timestamps (`created_at`, `updated_at`) in UTC ISO 8601
 
-Everything else is an encrypted blob.
+Everything else — name, URL, login, password, notes, TOTP secret — is an encrypted blob.
 
 ---
 
 ## Requirements
 
-- Python 3.10 or newer
-- Linux, macOS, or Windows (clipboard auto-clear requires `xclip`, `xsel`, or `wl-clipboard` on Linux)
+- Python 3.10+
+- Linux, macOS, or Windows
+- Clipboard support on Linux requires `xclip`, `xsel`, or `wl-clipboard`
 
 ---
 
@@ -53,126 +55,203 @@ chmod +x install.sh start.sh
 ./install.sh
 ```
 
-`install.sh` creates a `.venv` virtual environment and installs all dependencies from `requirements.txt`. It does not touch your system Python.
+`install.sh` creates a `.venv` virtual environment and installs all five dependencies from `requirements.txt`. Nothing touches your system Python.
 
 ---
 
-## Usage
+## Running
 
 ```bash
 ./start.sh
 ```
 
-On first run you will be asked to set two passwords.
+### First run
 
-**Master password** unlocks the vault normally. Minimum 12 characters.
+You will be asked to set two passwords before the vault is created.
 
-**Deadman password** triggers silent vault destruction if entered at the login prompt. It must differ from the master password. Also minimum 12 characters. There is no skip — both are required.
+**Master password** — unlocks the vault normally. Minimum 12 characters.
 
-After setup, the main menu:
-
-```
-[1] LIST      display vault entries
-[2] SEARCH    query by name/url/login
-[3] INJECT    add a new entry
-[4] MODIFY    edit an entry
-[5] PURGE     delete an entry
-[6] GENERATE  password generator
-[7] LOG       view audit trail
-[8] REKEY     change master password
-[9] CLONE     encrypted vault backup
-[10] TOTP     generate TOTP code
-[11] HEALTH   vault health check
-[0] EJECT     lock and exit
-```
+**Deadman password** — if entered at the login prompt, silently destroys the entire vault and exits with a fake error. Must differ from the master password. Also minimum 12 characters. There is no skip option — both passwords are required.
 
 ---
 
-## Password generator profiles
+## Menu
 
-| Profile | Description |
-|---|---|
-| `high` | Full charset (`a-z A-Z 0-9` + symbols), 16–96 chars. Default. |
-| `compat` | Letters, digits, and a reduced symbol set (`!@#$%*-_=+?`). For sites with strict rules. |
-| `no_symbols` | Letters and digits only. |
-| `pin` | Numeric only, 4–8 digits. |
-| `passphrase` | Random words joined by hyphens with a 4-digit suffix. Human-readable, still strong. |
+```
+[1]  LIST      display vault entries (passwords never shown in list)
+[2]  SEARCH    query by name, url, login, or notes
+[3]  INJECT    add a new entry
+[4]  MODIFY    edit an entry
+[5]  PURGE     permanently delete an entry
+[6]  GENERATE  password generator
+[7]  LOG       view audit trail
+[8]  REKEY     change master password and re-encrypt vault
+[9]  CLONE     create encrypted backup archive
+[10] TOTP      live TOTP code display with countdown
+[11] HEALTH    vault health and security report
+[12] SETTINGS  configure expiry threshold and auto-lock timeout
+[0]  EJECT     lock vault and exit
+```
 
-The generator loops until you accept — no recursion, no stack depth issues.
+Pressing `Ctrl+C` inside any command cancels it and returns to this menu. It does not exit the application.
 
 ---
 
-## Expiry
+## Entry fields
 
-Passwords not changed in 30 days are flagged `[EXPIRED]` in the list view. On every login, an expiry alert is shown listing all affected entries. You are never forced to update them.
+| Field | Required | Encrypted |
+|---|---|---|
+| name | yes | yes |
+| url | no | yes |
+| login | yes | yes |
+| password | yes | yes |
+| notes | no | yes |
+| totp_secret | no | yes |
+
+---
+
+## Password list — lazy decryption
+
+`LIST` and `SEARCH` decrypt `name`, `url`, and `login` for display. The `password` and `notes` fields are **never decrypted** during list or search operations — the password column is not present in the table at all. A full decrypt of a single entry only happens when you explicitly choose `[V] view` or `[C] copy password`.
+
+---
+
+## Copying a password
+
+From the list view, press `[C]` and enter the entry ID. The password is decrypted, sent to the clipboard, and **never printed to the terminal**. The clipboard is automatically cleared after 30 seconds.
 
 ---
 
 ## TOTP
 
-Store a TOTP secret (base32, the string behind a QR code) per entry. VaultTerm validates it on entry and can display the live 6-digit code with a countdown. The secret is encrypted like every other sensitive field.
+### How it works
+
+TOTP (RFC 6238) uses a shared secret and the current time — no server contact required. Both VaultTerm and the remote service independently compute `HMAC-SHA1(secret, floor(unix_time / 30))`, truncate it to six digits, and compare. The code changes every 30 seconds because the time counter increments.
+
+### Adding a TOTP secret
+
+During `INJECT` or `MODIFY`, paste the base32 string from your authenticator app's QR code (most apps let you reveal it as plain text). VaultTerm validates the secret immediately by generating the current code and displaying it so you can cross-check against your phone before the entry is saved.
+
+### Live display — `[10] TOTP`
+
+```
+  681289  [##########################....]  4s
+```
+
+The display updates every 0.5 seconds. The countdown bar depletes left to right as the 30-second window drains:
+
+- Bar **green**, code **cyan** when time is comfortable
+- Bar **yellow** when ≤ 10 seconds remain
+- Bar **red**, code **red** when ≤ 5 seconds remain — the **next** code appears in yellow so you have it ready before the current one expires
+
+Press `Enter` to exit the live display. The last visible code can be optionally copied to clipboard before returning to the menu.
+
+`[T]` in the list action bar triggers the same live display for any entry with a TOTP secret.
+
+### TOTP in the entry view
+
+`[V] view` shows the current code and seconds remaining as a snapshot. For the live ticker, use `[10] TOTP` or `[T]` from the list.
+
+---
+
+## Password generator — `[6] GENERATE`
+
+Five profiles:
+
+| Profile | Charset | Length |
+|---|---|---|
+| `high` | `a-z A-Z 0-9` + full symbol set | 16–96 |
+| `compat` | `a-z A-Z 0-9` + reduced symbols (`!@#$%*-_=+?`) | 16–96 |
+| `no_symbols` | `a-z A-Z 0-9` | 16–96 |
+| `pin` | digits only | 4–8 |
+| `passphrase` | random words joined by hyphens + 4-digit suffix | 4–8 words |
+
+All profiles except PIN guarantee at least one character from each applicable character class before filling the rest randomly. The generator loops until you accept — no recursion depth risk.
+
+The same generator is available inside `INJECT` and `MODIFY`.
+
+---
+
+## Password expiry
+
+Passwords not changed within the configured threshold are flagged `[EXPIRED]` in the list and trigger an alert on every login. The default is 30 days. You are never forced to rotate — expiry is advisory only.
+
+The threshold is configurable per vault via `[12] SETTINGS`.
 
 ---
 
 ## Password history
 
-Every password change pushes the old password's HMAC hash to a history table. When setting a new password, VaultTerm checks whether it has been used before for that entry. The check uses keyed HMAC comparison — no plaintext is stored or compared.
+Every password change pushes the previous password's HMAC-SHA256 hash to a history table. When you set a new password, VaultTerm checks whether that exact value has been used before for the same entry. The check uses constant-time HMAC comparison — no plaintext is ever stored in history or compared directly.
 
-History is cleared on master password change (rekey), because the HMAC hashes are bound to the old `hash_key` and cannot be re-derived.
+**History is cleared on master password change (rekey)** because the HMAC hashes are bound to the `hash_key` derived from the old master password. They cannot be compared against new passwords without storing the original plaintexts, which VaultTerm does not do.
 
 ---
 
-## Changing the master password
+## Search
 
-```
-[8] REKEY → [M] change master password
-```
+`[2] SEARCH` queries name, URL, login, and notes. Notes are only decrypted for entries that did not already match on the cheaper fields, so the common case pays no extra cost.
 
-Re-encryption is atomic. The operation wraps every row update in a single `BEGIN IMMEDIATE` transaction. If anything fails, the database is rolled back to the previous state and the meta file is not touched. Either the entire vault is re-encrypted or nothing changes.
+---
+
+## Changing the master password — `[8] REKEY`
+
+Re-encryption is atomic. All row updates run inside a single `BEGIN IMMEDIATE` transaction. The meta file is only written after the database commits successfully. If anything fails mid-operation, the database rolls back and the meta file is untouched — the vault is either fully re-encrypted under the new key or entirely unchanged under the old one.
 
 ---
 
 ## Deadman password
 
-If you enter the deadman password at the login prompt instead of the master password:
+If the deadman password is entered at the login prompt:
 
-1. The vault directory (`~/.vaultterm/`) is shredded: each file is overwritten with random bytes three times, then deleted.
-2. Any backup archives found in `~/.vaultterm/backups/` are also shredded.
-3. The application exits with a fake error message: `database corrupted. unable to recover vault state.`
+1. The vault directory (`~/.vaultterm/`) is shredded: each file is overwritten with random bytes three times before deletion.
+2. All backup archives in `~/.vaultterm/backups/` are also shredded.
+3. The application exits with the message: `database corrupted. unable to recover vault state.`
 
-No output distinguishes a deadman trigger from a database error. The attacker sees the same thing either way.
+No output distinguishes a deadman trigger from a genuine corruption error. The master password is always checked first; the deadman is only checked if the master fails. The resulting timing difference (one vs. two Argon2id derivations, roughly 0.5–2 seconds) is not meaningful in the coercion scenario this feature is designed for.
 
-> Note: Overwrite-based shredding is best-effort on SSDs due to wear leveling and flash translation layers. For full deniability on SSDs, full-disk encryption (LUKS, FileVault, BitLocker) is the correct layer.
-
----
-
-## Backups
-
-```
-[9] CLONE
-```
-
-Creates a `.tar.gz` archive containing `vault.db` and `meta.json` inside `~/.vaultterm/backups/`. Both files are required to restore. The archive is set to `0600`.
-
-To restore, place both files back in `~/.vaultterm/` and launch normally.
+> **SSD caveat.** Overwrite-based shredding is not guaranteed on SSDs due to wear leveling and flash translation layers. For reliable physical deniability, full-disk encryption (LUKS, FileVault, BitLocker) is the appropriate layer.
 
 ---
 
-## Health check
+## Backups — `[9] CLONE`
 
-```
-[11] HEALTH
-```
+Creates a `.tar.gz` archive of `vault.db` and `meta.json` inside `~/.vaultterm/backups/`, timestamped and set to `0600`. Both files are required to restore — the database without the meta file cannot be decrypted.
 
-Checks and reports on:
+To restore: extract both files into `~/.vaultterm/` and launch normally.
 
-- Database readability
-- Full decryptability of all entries
-- File permissions (`0700` / `0600`)
-- Weak passwords (strength score < 50)
-- Reused passwords (same hash across entries)
-- Expired passwords
-- Backup age
+---
+
+## Auto-lock
+
+The session locks after a configurable period of inactivity (default 10 minutes). The check fires at the start of each menu loop — it does not interrupt you mid-input. When triggered, the database connection is closed and re-authentication is required. Set to `0` to disable.
+
+---
+
+## Health check — `[11] HEALTH`
+
+| Check | What it verifies |
+|---|---|
+| DB readable | SQLite file opens without error |
+| Entries decryptable | Every entry decrypts successfully |
+| Vault dir permission | `~/.vaultterm` is `0700` |
+| DB permission | `vault.db` is `0600` |
+| Meta permission | `meta.json` is `0600` |
+| Weak passwords | Entries with a strength score below 50 |
+| Expired passwords | Entries past the configured expiry threshold |
+| Reused password hashes | Entries sharing an identical password |
+| Latest backup age | Days since the most recent backup archive |
+
+---
+
+## Settings — `[12] SETTINGS`
+
+Stored in the `settings` table inside `vault.db`. Persist across sessions. Applied immediately without restart.
+
+| Key | Default | Description |
+|---|---|---|
+| `expiry_days` | `30` | Days before a password is flagged `[EXPIRED]`. Minimum 1. |
+| `auto_lock_minutes` | `10` | Minutes of inactivity before the session locks. Set to `0` to disable. |
 
 ---
 
@@ -180,58 +259,69 @@ Checks and reports on:
 
 ```
 ~/.vaultterm/
-├── meta.json       # KDF parameters, salts, verify tokens (0600)
-├── vault.db        # Encrypted SQLite database (0600)
+├── meta.json          (0600)  KDF parameters, salts, verify tokens
+├── vault.db           (0600)  Encrypted SQLite database
 └── backups/
     └── vaultterm_YYYYMMDD_HHMMSS.tar.gz   (0600)
 ```
 
-### `meta.json` fields
+### `meta.json`
 
 ```json
 {
   "version": "3.0",
   "schema_version": 3,
   "cipher": "ChaCha20Poly1305",
-  "kdf": { "type": "argon2id", "time_cost": 3, "memory_cost": 262144, "parallelism": 2, "hash_len": 64, "salt_len": 32 },
-  "salt": "<base64>",
-  "deadman_salt": "<base64>",
-  "verify": "<base64(nonce + ciphertext)>",
-  "deadman_verify": "<base64(nonce + ciphertext)>",
+  "kdf": {
+    "type": "argon2id",
+    "time_cost": 3,
+    "memory_cost": 262144,
+    "parallelism": 2,
+    "hash_len": 64,
+    "salt_len": 32
+  },
+  "salt": "<base64url>",
+  "deadman_salt": "<base64url>",
+  "verify": "<base64url(nonce[12] | ciphertext_with_tag)>",
+  "deadman_verify": "<base64url(nonce[12] | ciphertext_with_tag)>",
   "created_at": "2025-01-01T00:00:00+00:00",
   "updated_at": "2025-01-01T00:00:00+00:00"
 }
 ```
 
-The `verify` token is the string `VAULTTERM::ONLINE::v3` encrypted with the master key. The `deadman_verify` token is `VAULTTERM::DEADMAN::v3` encrypted with the deadman key. They use different salts, different derived keys, and different sentinel values — a master key cannot verify a deadman token and vice versa.
+`verify` holds the string `VAULTTERM::ONLINE::v3` encrypted with the master key. `deadman_verify` holds `VAULTTERM::DEADMAN::v3` encrypted with the deadman key. They use different salts, different derived keys, and different sentinel strings — a master key cannot decrypt a deadman token and vice versa.
+
+### SQLite tables
+
+```
+entries          one row per credential; all sensitive columns are encrypted blobs
+password_history HMAC-SHA256 hashes of previous passwords per entry (no plaintext)
+log              action code + entry ID only; no sensitive content
+settings         per-vault key/value configuration
+```
 
 ---
 
 ## Dependencies
 
 ```
-rich>=13.7.0         # terminal UI
-cryptography>=42.0.0 # ChaCha20-Poly1305
-argon2-cffi>=23.1.0  # Argon2id KDF
-pyotp>=2.9.0         # TOTP
-pyperclip>=1.8.2     # clipboard
+rich>=13.7.0         terminal UI
+cryptography>=42.0.0 ChaCha20-Poly1305
+argon2-cffi>=23.1.0  Argon2id key derivation
+pyotp>=2.9.0         TOTP generation and validation
+pyperclip>=1.8.2     clipboard integration
 ```
 
-All installed into `.venv` by `install.sh`. Nothing is installed system-wide.
-
----
-
-## Auto-lock
-
-The session locks after 10 minutes of inactivity by default. The timeout is configurable per vault. When triggered, the derived key is wiped from memory, the database connection is closed, and re-authentication is required.
+All installed into `.venv` by `install.sh`. No system-wide installation.
 
 ---
 
 ## Known limitations
 
-- **SSD shredding is not guaranteed.** See deadman note above.
-- **Windows clipboard auto-clear** may not work without additional dependencies.
-- **History is cleared on rekey.** HMAC hashes are key-bound and cannot survive a key change.
+- **SSD shredding is not guaranteed.** See deadman caveat.
+- **Password history is cleared on rekey.** HMAC hashes are key-bound and cannot survive a master password change without storing plaintext.
+- **Windows clipboard auto-clear** may not work without a compatible clipboard utility installed.
+- **Auto-lock fires at menu boundaries**, not mid-input. It does not interrupt active typing.
 
 ---
 
