@@ -25,18 +25,6 @@
 #   ./compile.sh pyinstaller-onefile --upx
 #   ./compile.sh nuitka-onefile --sign
 #   ./compile.sh nuitka --sign --sign-key 0xABCD1234
-#
-# SECURITY MEASURES APPLIED
-#   - Source SHA-256 verified before compilation begins
-#   - Debug symbols stripped from output (Linux/macOS)
-#   - Unnecessary stdlib modules excluded from bundles
-#   - .pyc bytecode files removed from PyInstaller bundles
-#   - SHA-256 checksum of every output binary written to <binary>.sha256
-#   - Optional GPG detached signature written to <binary>.sig
-#   - Output file permissions set to 0755 (binary) and 0600 (checksum/sig)
-#   - PyInstaller onefile: /tmp extraction path noted in warnings
-#   - Nuitka: docstrings and site.py stripped from compiled output
-#   - All intermediate build artefacts cleaned unless --no-clean is set
 # =============================================================================
 
 set -euo pipefail
@@ -180,63 +168,85 @@ mkdir -p "$OUTPUT_DIR"
 
 # ── module exclusion list (shared by both backends) ───────────────────────────
 #
-# These stdlib modules are provably unused by vaultterm.py.
-# Excluding them reduces bundle size and shrinks the attack surface of
-# the embedded interpreter.
+# Only modules that are provably unused by vaultterm.py AND all of its
+# transitive dependencies (rich, cryptography, argon2-cffi, pyotp, pyperclip).
+#
+# IMPORTANT: rich has non-obvious stdlib dependencies:
+#   colorsys  — rich/color.py uses it for RGB↔HLS conversions        DO NOT exclude
+#   html      — rich/markup.py uses html.escape for rendering         DO NOT exclude
+#   webbrowser— rich/console.py conditionally imports it for links    DO NOT exclude
+#   warnings  — rich uses warnings.warn throughout                    DO NOT exclude
+#   email     — transitively reachable via mimetypes/urllib chains    DO NOT exclude
+#
+# When in doubt, leave a module in. Nuitka converts a missing transitive
+# import into a hard RuntimeError; the binary builds fine but crashes.
 
 EXCLUDE_MODS=(
+    # GUI / graphics — definitely not needed
     tkinter
     turtle
+    idlelib
+    curses
+
+    # Easter eggs
+    antigravity
+    this
+
+    # Testing / debugging
     unittest
     pdb
     doctest
-    xmlrpc
-    xmlrpc.client
-    xmlrpc.server
+
+    # Network protocols not used by any dependency
     ftplib
     imaplib
     poplib
     smtplib
     nntplib
     telnetlib
+
+    # RPC / server frameworks
+    xmlrpc
     http.server
     wsgiref
+    socketserver
     cgi
     cgitb
+
+    # Packaging / installation tools
     distutils
     ensurepip
     venv
-    curses
-    idlelib
+
+    # Python 2→3 migration tool
     lib2to3
-    antigravity
-    this
-    email
-    mailbox
-    mimetypes
-    multiprocessing.popen_forkserver
-    multiprocessing.popen_fork
-    socketserver
-    xmlrpc
-    html
-    webbrowser
-    colorsys
-    imghdr
+
+    # Audio / multimedia
     sunau
     aifc
     audioop
+    ossaudiodev
+    imghdr
     chunk
+
+    # Deprecated Unix auth modules (removed in Python 3.13)
     crypt
     nis
-    ossaudiodev
     spwd
     pipes
+
+    # Multiprocessing fork backends (we only use threading)
+    multiprocessing.popen_forkserver
+    multiprocessing.popen_fork
 )
 
 # ── hidden imports required by cryptography + argon2-cffi ─────────────────────
 #
 # Both libraries rely on CFFI and Rust native extensions.
 # PyInstaller misses these without explicit declaration.
+# colorsys and warnings are stdlib but included explicitly because rich
+# needs colorsys and Python 3.12+ made warnings a pure-Python module that
+# some bundlers miss.
 
 HIDDEN_IMPORTS=(
     cryptography
@@ -264,6 +274,8 @@ HIDDEN_IMPORTS=(
     rich.prompt
     rich.text
     rich.rule
+    colorsys
+    warnings
 )
 
 # ── helper: strip + upx + permissions ─────────────────────────────────────────
@@ -536,7 +548,6 @@ build_nuitka_dir() {
         --output-dir="$outdir" \
         --python-flag=no_site \
         --python-flag=no_docstrings \
-        --python-flag=no_warnings \
         --python-flag=isolated \
         --assume-yes-for-downloads \
         --remove-output \
@@ -548,6 +559,8 @@ build_nuitka_dir() {
         --include-package=pyotp \
         --include-package=pyperclip \
         --include-package=cffi \
+        --include-module=colorsys \
+        --include-module=warnings \
         "${nofollow_flags[@]}" \
         "$SOURCE"
 
@@ -600,7 +613,6 @@ build_nuitka_onefile() {
         --output-dir="$outdir" \
         --python-flag=no_site \
         --python-flag=no_docstrings \
-        --python-flag=no_warnings \
         --python-flag=isolated \
         --assume-yes-for-downloads \
         --remove-output \
@@ -612,6 +624,8 @@ build_nuitka_onefile() {
         --include-package=pyotp \
         --include-package=pyperclip \
         --include-package=cffi \
+        --include-module=colorsys \
+        --include-module=warnings \
         "${nofollow_flags[@]}" \
         "$SOURCE"
 
