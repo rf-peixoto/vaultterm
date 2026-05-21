@@ -16,8 +16,10 @@ import sqlite3
 import string
 import sys
 import tarfile
+import tempfile
 import threading
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -45,8 +47,8 @@ except Exception:
 
 # ── user-tunable settings ─────────────────────────────────────────────────────
 
-VERSION = "3.0"
-SCHEMA_VERSION = 3
+VERSION = "3.0-hardened"
+SCHEMA_VERSION = 4
 VAULT_DIR = Path.home() / ".vaultterm"
 DB_PATH = VAULT_DIR / "vault.db"
 META_PATH = VAULT_DIR / "meta.json"
@@ -70,7 +72,17 @@ ARGON2_PARAMS = {
 
 SENTINEL = "VAULTTERM::ONLINE::v3"
 DEADMAN_SENTINEL = "VAULTTERM::DEADMAN::v3"
-AAD = b"vaultterm-v3"
+AAD_LEGACY = b"vaultterm-v3"
+AAD_PREFIX = f"vaultterm|schema={SCHEMA_VERSION}".encode("utf-8")
+ENTRY_ENCRYPTED_FIELDS = ("name", "url", "login", "password", "notes", "totp_secret")
+
+def aad_for_entry(entry_uuid: str, field: str) -> bytes:
+    if field not in ENTRY_ENCRYPTED_FIELDS:
+        raise ValueError(f"invalid encrypted field for AAD: {field}")
+    return AAD_PREFIX + b"|entry|" + entry_uuid.encode("utf-8") + b"|field|" + field.encode("utf-8")
+
+def aad_for_meta(label: str) -> bytes:
+    return AAD_PREFIX + b"|meta|" + label.encode("utf-8")
 
 # ── palette ───────────────────────────────────────────────────────────────────
 
@@ -180,14 +192,28 @@ def secure_mkdir(path: Path):
 
 
 def secure_file(path: Path):
-    if os.name != "nt" and path.exists():
+    if not path.exists():
+        return
+    if os.name != "nt":
         os.chmod(path, 0o600)
+    else:
+        # Best-effort local-user-only ACL hardening on Windows. This is not a
+        # substitute for a properly hardened host, but it avoids the previous
+        # behavior where Windows was effectively treated as permissionless.
+        try:
+            import subprocess
+            subprocess.run(["icacls", str(path), "/inheritance:r"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+            user = os.environ.get("USERNAME")
+            if user:
+                subprocess.run(["icacls", str(path), "/grant:r", f"{user}:F"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        except Exception:
+            pass
 
 
 def set_permissions():
     secure_mkdir(VAULT_DIR)
     secure_mkdir(BACKUP_DIR)
-    for p in (DB_PATH, META_PATH):
+    for p in (DB_PATH, META_PATH, Path(str(DB_PATH) + "-wal"), Path(str(DB_PATH) + "-shm"), Path(str(DB_PATH) + "-journal")):
         secure_file(p)
     for p in BACKUP_DIR.glob("*"):
         if p.is_file():
@@ -272,19 +298,31 @@ class Crypto:
     def init(self, password: str, salt: bytes, params: Dict):
         self.init_from_raw(self.derive(password, salt, params))
 
-    def enc(self, text: str) -> str:
+    def enc(self, text: str, aad: bytes) -> str:
         if self.enc_key is None:
             raise RuntimeError("crypto not ready")
         nonce = os.urandom(12)
-        ct = ChaCha20Poly1305(self.enc_key).encrypt(nonce, text.encode("utf-8"), AAD)
+        ct = ChaCha20Poly1305(self.enc_key).encrypt(nonce, text.encode("utf-8"), aad)
         return b64e(nonce + ct)
 
-    def dec(self, token: str) -> str:
+    def dec(self, token: str, aad: bytes) -> str:
         if self.enc_key is None:
             raise RuntimeError("crypto not ready")
         raw = b64d(token)
         nonce, ct = raw[:12], raw[12:]
-        return ChaCha20Poly1305(self.enc_key).decrypt(nonce, ct, AAD).decode("utf-8")
+        return ChaCha20Poly1305(self.enc_key).decrypt(nonce, ct, aad).decode("utf-8")
+
+    def legacy_dec(self, token: str) -> str:
+        if self.enc_key is None:
+            raise RuntimeError("crypto not ready")
+        raw = b64d(token)
+        return ChaCha20Poly1305(self.enc_key).decrypt(raw[:12], raw[12:], AAD_LEGACY).decode("utf-8")
+
+    def enc_field(self, entry_uuid: str, field: str, text: str) -> str:
+        return self.enc(text, aad_for_entry(entry_uuid, field))
+
+    def dec_field(self, entry_uuid: str, field: str, token: str) -> str:
+        return self.dec(token, aad_for_entry(entry_uuid, field))
 
     def pw_hash(self, password: str) -> str:
         if self.hash_key is None:
@@ -292,12 +330,22 @@ class Crypto:
         return b64e(hmac.new(self.hash_key, password.encode("utf-8"), hashlib.sha256).digest())
 
     @staticmethod
-    def verify_with_raw(raw: bytes, token: str) -> bool:
+    def verify_with_raw(raw: bytes, token: str, expected: str, aad: bytes) -> bool:
         try:
             enc_key = raw[:32]
             blob = b64d(token)
-            ChaCha20Poly1305(enc_key).decrypt(blob[:12], blob[12:], AAD)
-            return True
+            pt = ChaCha20Poly1305(enc_key).decrypt(blob[:12], blob[12:], aad).decode("utf-8")
+            return hmac.compare_digest(pt, expected)
+        except Exception:
+            return False
+
+    @staticmethod
+    def legacy_verify_with_raw(raw: bytes, token: str, expected: str) -> bool:
+        try:
+            enc_key = raw[:32]
+            blob = b64d(token)
+            pt = ChaCha20Poly1305(enc_key).decrypt(blob[:12], blob[12:], AAD_LEGACY).decode("utf-8")
+            return hmac.compare_digest(pt, expected)
         except Exception:
             return False
 
@@ -307,6 +355,27 @@ class Crypto:
 class Meta:
     def __init__(self, path: Path):
         self.path = path
+
+    def _atomic_write(self, data: Dict):
+        secure_mkdir(self.path.parent)
+        prev_umask = os.umask(0o077)
+        tmp_name = None
+        try:
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=str(self.path.parent), delete=False) as fh:
+                tmp_name = fh.name
+                json.dump(data, fh, indent=2)
+                fh.write("\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp_name, self.path)
+            secure_file(self.path)
+        finally:
+            os.umask(prev_umask)
+            if tmp_name:
+                try:
+                    Path(tmp_name).unlink(missing_ok=True)
+                except Exception:
+                    pass
 
     def exists(self) -> bool:
         return self.path.exists()
@@ -344,21 +413,19 @@ class Meta:
             "kdf": ARGON2_PARAMS,
             "salt": b64e(salt),
             "deadman_salt": b64e(dead_salt),
-            "verify": crypto.enc(SENTINEL),
-            "deadman_verify": dead_crypto.enc(DEADMAN_SENTINEL),
+            "verify": crypto.enc(SENTINEL, aad_for_meta("verify")),
+            "deadman_verify": dead_crypto.enc(DEADMAN_SENTINEL, aad_for_meta("deadman_verify")),
             "created_at": utc_now(),
             "updated_at": utc_now(),
         }
-        self.path.write_text(json.dumps(data, indent=2))
-        secure_file(self.path)
+        self._atomic_write(data)
 
     def update_master(self, salt: bytes, verify_token: str):
         d = self.load()
         d["salt"] = b64e(salt)
         d["verify"] = verify_token
         d["updated_at"] = utc_now()
-        self.path.write_text(json.dumps(d, indent=2))
-        secure_file(self.path)
+        self._atomic_write(d)
 
 # ── database ─────────────────────────────────────────────────────────────────
 
@@ -371,12 +438,20 @@ class DB:
 
     def open(self):
         secure_mkdir(self.path.parent)
-        self._db = sqlite3.connect(str(self.path), check_same_thread=False)
+        prev_umask = os.umask(0o077)
+        try:
+            self._db = sqlite3.connect(str(self.path), check_same_thread=False)
+        finally:
+            os.umask(prev_umask)
         self._db.row_factory = sqlite3.Row
-        self._db.execute("PRAGMA journal_mode=WAL")
+        self._db.execute("PRAGMA journal_mode=DELETE")
+        self._db.execute("PRAGMA secure_delete=ON")
         self._db.execute("PRAGMA foreign_keys=ON")
+        self._db.execute("PRAGMA synchronous=FULL")
+        self._db.execute("PRAGMA temp_store=MEMORY")
         self._schema()
-        secure_file(self.path)
+        self._migrate_context_bound_encryption()
+        set_permissions()
 
     def close(self):
         if self._db:
@@ -392,9 +467,12 @@ class DB:
             INSERT OR REPLACE INTO settings (key,value) VALUES ('schema_version','{SCHEMA_VERSION}');
             INSERT OR IGNORE  INTO settings (key,value) VALUES ('expiry_days',   '{EXPIRY_DAYS}');
             INSERT OR IGNORE  INTO settings (key,value) VALUES ('auto_lock_minutes', '10');
+            INSERT OR IGNORE  INTO settings (key,value) VALUES ('clipboard_enabled', '0');
+            INSERT OR IGNORE  INTO settings (key,value) VALUES ('aad_migrated_v4', '0');
 
             CREATE TABLE IF NOT EXISTS entries (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                entry_uuid TEXT NOT NULL DEFAULT '',
                 name TEXT NOT NULL,
                 url TEXT NOT NULL DEFAULT '',
                 login TEXT NOT NULL,
@@ -422,6 +500,40 @@ class DB:
             );
         """)
         self._db.commit()
+        cols = [r[1] for r in self._db.execute("PRAGMA table_info(entries)").fetchall()]
+        if "entry_uuid" not in cols:
+            self._db.execute("ALTER TABLE entries ADD COLUMN entry_uuid TEXT NOT NULL DEFAULT ''")
+            self._db.commit()
+
+    def _migrate_context_bound_encryption(self):
+        if self.setting("aad_migrated_v4", "0") == "1":
+            return
+        rows = self._db.execute("SELECT * FROM entries ORDER BY id").fetchall()
+        self._db.execute("BEGIN IMMEDIATE")
+        try:
+            for r in rows:
+                raw = dict(r)
+                entry_uuid = raw.get("entry_uuid") or str(uuid.uuid4())
+                values = {"entry_uuid": entry_uuid}
+                for field in ENTRY_ENCRYPTED_FIELDS:
+                    token = raw.get(field) or ""
+                    if not token:
+                        values[field] = ""
+                        continue
+                    try:
+                        # Already context-bound; normalize by decrypting/re-encrypting.
+                        plain = self.crypto.dec_field(entry_uuid, field, token)
+                    except Exception:
+                        # Legacy vaults used one global AAD for every field.
+                        plain = self.crypto.legacy_dec(token)
+                    values[field] = self.crypto.enc_field(entry_uuid, field, plain)
+                clause = ", ".join(f"{k}=?" for k in values)
+                self._db.execute(f"UPDATE entries SET {clause} WHERE id=?", [*values.values(), raw["id"]])
+            self._db.execute("INSERT OR REPLACE INTO settings (key,value) VALUES ('aad_migrated_v4','1')")
+            self._db.commit()
+        except Exception:
+            self._db.rollback()
+            raise
 
     def _log(self, action: str, entry_id: Optional[int] = None):
         self._db.execute("INSERT INTO log (ts,action,entry_id) VALUES (?,?,?)", (utc_now(), action, entry_id))
@@ -430,9 +542,10 @@ class DB:
         d = dict(row)
         out = {
             "id": d["id"],
-            "name": self._safe_dec(d["name"], "[ERR:DECRYPT]"),
-            "url": self._safe_dec(d["url"], "") if d.get("url") else "",
-            "login": self._safe_dec(d["login"], "[ERR:DECRYPT]"),
+            "entry_uuid": d.get("entry_uuid") or "",
+            "name": self._safe_dec(d.get("entry_uuid") or "", "name", d["name"], "[ERR:DECRYPT]"),
+            "url": self._safe_dec(d.get("entry_uuid") or "", "url", d["url"], "") if d.get("url") else "",
+            "login": self._safe_dec(d.get("entry_uuid") or "", "login", d["login"], "[ERR:DECRYPT]"),
             "has_notes": bool(d.get("notes")),
             "has_totp": bool(d.get("totp_secret")),
             "created_at": d["created_at"],
@@ -445,15 +558,16 @@ class DB:
     def _row_full(self, row: sqlite3.Row) -> Dict:
         d = self._row_summary(row)
         raw = dict(row)
-        d["password"] = self.crypto.dec(raw["password"])
-        d["notes"] = self.crypto.dec(raw["notes"]) if raw.get("notes") else ""
-        d["totp_secret"] = self.crypto.dec(raw["totp_secret"]) if raw.get("totp_secret") else ""
+        entry_uuid = raw.get("entry_uuid") or d.get("entry_uuid") or ""
+        d["password"] = self.crypto.dec_field(entry_uuid, "password", raw["password"])
+        d["notes"] = self.crypto.dec_field(entry_uuid, "notes", raw["notes"]) if raw.get("notes") else ""
+        d["totp_secret"] = self.crypto.dec_field(entry_uuid, "totp_secret", raw["totp_secret"]) if raw.get("totp_secret") else ""
         d["password_hash"] = raw["password_hash"]
         return d
 
-    def _safe_dec(self, token: str, fallback: str) -> str:
+    def _safe_dec(self, entry_uuid: str, field: str, token: str, fallback: str) -> str:
         try:
-            return self.crypto.dec(token)
+            return self.crypto.dec_field(entry_uuid, field, token)
         except Exception:
             return fallback
 
@@ -476,7 +590,7 @@ class DB:
                 matches.append(s)
             elif dict(row).get("notes"):
                 # Only decrypt notes when the entry didn't already match on cheaper fields
-                notes = self._safe_dec(dict(row)["notes"], "")
+                notes = self._safe_dec(dict(row).get("entry_uuid") or "", "notes", dict(row)["notes"], "")
                 if q in notes.lower():
                     matches.append(s)
         return sorted(matches, key=lambda x: x["name"].lower())
@@ -501,10 +615,11 @@ class DB:
     def add(self, name: str, url: str, login: str, password: str, notes: str = "", totp_secret: str = "") -> int:
         now = utc_now()
         ph = self.crypto.pw_hash(password)
+        entry_uuid = str(uuid.uuid4())
         cur = self._db.execute(
-            "INSERT INTO entries (name,url,login,password,notes,totp_secret,password_hash,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
-            (self.crypto.enc(name), self.crypto.enc(url) if url else "", self.crypto.enc(login), self.crypto.enc(password),
-             self.crypto.enc(notes) if notes else "", self.crypto.enc(totp_secret) if totp_secret else "", ph, now, now),
+            "INSERT INTO entries (entry_uuid,name,url,login,password,notes,totp_secret,password_hash,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (entry_uuid, self.crypto.enc_field(entry_uuid, "name", name), self.crypto.enc_field(entry_uuid, "url", url) if url else "", self.crypto.enc_field(entry_uuid, "login", login), self.crypto.enc_field(entry_uuid, "password", password),
+             self.crypto.enc_field(entry_uuid, "notes", notes) if notes else "", self.crypto.enc_field(entry_uuid, "totp_secret", totp_secret) if totp_secret else "", ph, now, now),
         )
         eid = int(cur.lastrowid)
         self._db.execute("INSERT INTO password_history (entry_id,password_hash,changed_at) VALUES (?,?,?)", (eid, ph, now))
@@ -516,20 +631,21 @@ class DB:
         current = self.get_full(eid)
         if not current:
             return
-        fields = {"updated_at": utc_now()}
+        entry_uuid = current.get("entry_uuid") or str(uuid.uuid4())
+        fields = {"entry_uuid": entry_uuid, "updated_at": utc_now()}
         if "name" in kw:
-            fields["name"] = self.crypto.enc(kw["name"])
+            fields["name"] = self.crypto.enc_field(entry_uuid, "name", kw["name"])
         if "url" in kw:
-            fields["url"] = self.crypto.enc(kw["url"]) if kw["url"] else ""
+            fields["url"] = self.crypto.enc_field(entry_uuid, "url", kw["url"]) if kw["url"] else ""
         if "login" in kw:
-            fields["login"] = self.crypto.enc(kw["login"])
+            fields["login"] = self.crypto.enc_field(entry_uuid, "login", kw["login"])
         if "notes" in kw:
-            fields["notes"] = self.crypto.enc(kw["notes"]) if kw["notes"] else ""
+            fields["notes"] = self.crypto.enc_field(entry_uuid, "notes", kw["notes"]) if kw["notes"] else ""
         if "totp_secret" in kw:
-            fields["totp_secret"] = self.crypto.enc(kw["totp_secret"]) if kw["totp_secret"] else ""
+            fields["totp_secret"] = self.crypto.enc_field(entry_uuid, "totp_secret", kw["totp_secret"]) if kw["totp_secret"] else ""
         if "password" in kw:
             old_hash = current["password_hash"]
-            fields["password"] = self.crypto.enc(kw["password"])
+            fields["password"] = self.crypto.enc_field(entry_uuid, "password", kw["password"])
             fields["password_hash"] = self.crypto.pw_hash(kw["password"])
             self._db.execute("INSERT INTO password_history (entry_id,password_hash,changed_at) VALUES (?,?,?)", (eid, old_hash, utc_now()))
             self._db.execute("INSERT INTO password_history (entry_id,password_hash,changed_at) VALUES (?,?,?)", (eid, fields["password_hash"], utc_now()))
@@ -581,15 +697,15 @@ class DB:
                 new_ph = new_crypto.pw_hash(full["password"])
                 self._db.execute(
                     "UPDATE entries SET name=?,url=?,login=?,password=?,notes=?,totp_secret=?,password_hash=? WHERE id=?",
-                    (new_crypto.enc(full["name"]), new_crypto.enc(full["url"]) if full["url"] else "",
-                     new_crypto.enc(full["login"]), new_crypto.enc(full["password"]),
-                     new_crypto.enc(full["notes"]) if full["notes"] else "",
-                     new_crypto.enc(full["totp_secret"]) if full["totp_secret"] else "", new_ph, full["id"]),
+                    (new_crypto.enc_field(full["entry_uuid"], "name", full["name"]), new_crypto.enc_field(full["entry_uuid"], "url", full["url"]) if full["url"] else "",
+                     new_crypto.enc_field(full["entry_uuid"], "login", full["login"]), new_crypto.enc_field(full["entry_uuid"], "password", full["password"]),
+                     new_crypto.enc_field(full["entry_uuid"], "notes", full["notes"]) if full["notes"] else "",
+                     new_crypto.enc_field(full["entry_uuid"], "totp_secret", full["totp_secret"]) if full["totp_secret"] else "", new_ph, full["id"]),
                 )
                 self._db.execute("DELETE FROM password_history WHERE entry_id=?", (full["id"],))
                 self._db.execute("INSERT INTO password_history (entry_id,password_hash,changed_at) VALUES (?,?,?)", (full["id"], new_ph, utc_now()))
             self._log("REKEY", None)
-            verify = new_crypto.enc(SENTINEL)
+            verify = new_crypto.enc(SENTINEL, aad_for_meta("verify"))
             meta.update_master(new_salt, verify)
             self._db.commit()
         except Exception:
@@ -755,8 +871,13 @@ class VaultTerm:
             pw = ask_pw("master password")
             try:
                 raw = Crypto.derive(pw, b64d(md["salt"]), params)
-                if Crypto.verify_with_raw(raw, md["verify"]):
+                if Crypto.verify_with_raw(raw, md["verify"], SENTINEL, aad_for_meta("verify")) or Crypto.legacy_verify_with_raw(raw, md["verify"], SENTINEL):
                     self.crypto.init_from_raw(raw)
+                    try:
+                        if Crypto.legacy_verify_with_raw(raw, md["verify"], SENTINEL):
+                            self.meta.update_master(b64d(md["salt"]), self.crypto.enc(SENTINEL, aad_for_meta("verify")))
+                    except Exception:
+                        pass
                     self.db = DB(DB_PATH, self.crypto)
                     self.db.open()
                     ok("access granted.")
@@ -764,7 +885,7 @@ class VaultTerm:
                     self.touch()
                     return
                 dead_raw = Crypto.derive(pw, b64d(md["deadman_salt"]), params)
-                if Crypto.verify_with_raw(dead_raw, md["deadman_verify"]):
+                if Crypto.verify_with_raw(dead_raw, md["deadman_verify"], DEADMAN_SENTINEL, aad_for_meta("deadman_verify")) or Crypto.legacy_verify_with_raw(dead_raw, md["deadman_verify"], DEADMAN_SENTINEL):
                     shred_vault()
                     console.print(f"\n  [{C_ERR}][ERR][/{C_ERR}] database corrupted. unable to recover vault state.\n")
                     sys.exit(2)
@@ -878,7 +999,12 @@ class VaultTerm:
         except ValueError:
             err("expected a numeric id."); return None
 
+    def _clipboard_allowed(self) -> bool:
+        return self.db.setting("clipboard_enabled", "0") == "1"
+
     def _copy(self, entries: List[Dict]):
+        if not self._clipboard_allowed():
+            err("clipboard use is disabled. Enable it in SETTINGS only if your local threat model allows it."); pause(); return
         if not _CLIP:
             err("clipboard unavailable. install xclip/xsel/wl-clipboard on Linux."); pause(); return
         e = self._pick(entries, "entry id to copy")
@@ -898,7 +1024,8 @@ class VaultTerm:
         def row(k, v, vc=C_DATA): console.print(f"  [{C_DIM}]{k:<10}[/{C_DIM}]  [{vc}]{v}[/{vc}]")
         console.print(); console.print(sep)
         row("ID", str(full["id"]), C_DIM); row("NAME", full["name"]); row("URL", full.get("url") or "—", C_DIM)
-        row("LOGIN", full["login"], C_LABEL); row("PASSWORD", full["password"], C_PW)
+        row("LOGIN", full["login"], C_LABEL); row("PASSWORD", "[hidden]", C_DIM)
+        if Confirm.ask("  reveal password once on screen?", default=False): row("PASSWORD", full["password"], C_PW)
         row("CREATED", local_date(full["created_at"]), C_DIM); row("UPDATED", local_date(full["updated_at"]), C_DIM)
         row("AGE", f"{full['age']} day(s)", C_ERR if full["expired"] else C_DIM)
         if full.get("notes"): row("NOTES", full["notes"], C_DIM)
@@ -1037,7 +1164,9 @@ class VaultTerm:
                 except ValueError: length = 24
                 pw = gen_pw(length, profile)
             sc, label, color = strength(pw)
-            console.print(f"\n  [{C_DIM}]generated  [/{C_DIM}][{C_PW}]{pw}[/{C_PW}]")
+            console.print(f"\n  [{C_DIM}]generated  [/{C_DIM}][{C_DIM}][hidden: {len(pw)} chars][/{C_DIM}]")
+            if Confirm.ask("  reveal generated password once?", default=False):
+                console.print(f"  [{C_DIM}]value      [/{C_DIM}][{C_PW}]{pw}[/{C_PW}]")
             console.print(f"  [{C_DIM}]strength   [/{C_DIM}]", end=""); console.print(strength_bar(sc), end="")
             console.print(f"  [{color}]{label}[/{color}] ({sc}/100)\n")
             if eid is not None and self.db.password_was_used(eid, pw):
@@ -1062,7 +1191,7 @@ class VaultTerm:
         banner(); header("GENERATE -- STANDALONE")
         while True:
             pw = self._gen_pw()
-            if _CLIP and Confirm.ask("  copy to clipboard?", default=True):
+            if self._clipboard_allowed() and _CLIP and Confirm.ask("  copy to clipboard?", default=False):
                 pyperclip.copy(pw); ok(f"copied. clears in {CLIPBOARD_CLEAR_SECONDS} seconds."); _clip_clear(pw)
             if not Confirm.ask("  generate another?", default=False): break
         pause()
@@ -1197,7 +1326,7 @@ class VaultTerm:
         console.print()
 
         # Offer clipboard copy of the last displayed code
-        if last_code and _CLIP:
+        if last_code and self._clipboard_allowed() and _CLIP:
             if Confirm.ask(f"  copy [{last_code}] to clipboard?", default=False):
                 pyperclip.copy(last_code)
                 _clip_clear(last_code)
@@ -1222,7 +1351,7 @@ class VaultTerm:
         md = self.meta.load()
         try:
             raw = Crypto.derive(cur, b64d(md["salt"]), md["kdf"])
-            if not Crypto.verify_with_raw(raw, md["verify"]):
+            if not (Crypto.verify_with_raw(raw, md["verify"], SENTINEL, aad_for_meta("verify")) or Crypto.legacy_verify_with_raw(raw, md["verify"], SENTINEL)):
                 err("authentication failed."); pause(); return
         except Exception:
             err("authentication failed."); pause(); return
@@ -1294,14 +1423,18 @@ class VaultTerm:
 
         cur_expiry = self.db.setting("expiry_days",       str(EXPIRY_DAYS))
         cur_lock   = self.db.setting("auto_lock_minutes", "10")
+        cur_clip   = self.db.setting("clipboard_enabled", "0")
 
         console.print(f"  [{C_DIM}]expiry_days       [/{C_DIM}]  [{C_DATA}]{cur_expiry}[/{C_DATA}]"
                       f"  [{C_DIM}]days before a password is flagged [EXPIRED][/{C_DIM}]")
         console.print(f"  [{C_DIM}]auto_lock_minutes [/{C_DIM}]  [{C_DATA}]{cur_lock}[/{C_DATA}]"
-                      f"  [{C_DIM}]minutes of inactivity before lock (0 = disabled)[/{C_DIM}]\n")
+                      f"  [{C_DIM}]minutes of inactivity before lock (0 = disabled)[/{C_DIM}]")
+        console.print(f"  [{C_DIM}]clipboard_enabled [/{C_DIM}]  [{C_DATA}]{cur_clip}[/{C_DATA}]"
+                      f"  [{C_DIM}]0 = disabled, 1 = enabled[/{C_DIM}]\n")
 
         new_expiry = Prompt.ask(f"  [{C_HEAD}]expiry_days[/{C_HEAD}]",       default=cur_expiry)
         new_lock   = Prompt.ask(f"  [{C_HEAD}]auto_lock_minutes[/{C_HEAD}]", default=cur_lock)
+        new_clip   = Prompt.ask(f"  [{C_HEAD}]clipboard_enabled[/{C_HEAD}]", default=cur_clip, choices=["0", "1"], show_choices=False)
 
         errors = []
         try:
@@ -1324,6 +1457,7 @@ class VaultTerm:
         if not errors or Confirm.ask("  save valid values anyway?", default=False):
             self.db.set_setting("expiry_days",       str(ed))
             self.db.set_setting("auto_lock_minutes", str(lm))
+            self.db.set_setting("clipboard_enabled", new_clip)
             ok("settings saved.")
 
         pause()
