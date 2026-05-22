@@ -47,7 +47,7 @@ except Exception:
 
 # ── user-tunable settings ─────────────────────────────────────────────────────
 
-VERSION = "3.0-hardened"
+VERSION = "3.0"
 SCHEMA_VERSION = 4
 VAULT_DIR = Path.home() / ".vaultterm"
 DB_PATH = VAULT_DIR / "vault.db"
