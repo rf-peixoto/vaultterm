@@ -626,7 +626,14 @@ class DB:
              self.crypto.enc_field(entry_uuid, "notes", notes) if notes else "", self.crypto.enc_field(entry_uuid, "totp_secret", totp_secret) if totp_secret else "", ph, now, now),
         )
         eid = int(cur.lastrowid)
-        self._db.execute("INSERT INTO password_history (entry_id,password_hash,changed_at) VALUES (?,?,?)", (eid, ph, now))
+        # FIX 9: do NOT insert the initial hash into password_history here.
+        # The initial hash already lives in entries.password_hash, and
+        # password_was_used() checks that column first before touching history.
+        # Inserting it into history too meant that after the very first password
+        # rotation, history held two identical rows for the original hash —
+        # effectively halving usable history depth from the first change onward.
+        # The design intent (documented in update()) is: history stores only
+        # *retired* hashes; the live hash is always in entries.password_hash.
         self._log("ADD", eid)
         self._db.commit()
         return eid
@@ -1536,4 +1543,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
