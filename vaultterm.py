@@ -28,6 +28,7 @@ from argon2.low_level import Type, hash_secret_raw
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from rich import box
 from rich.console import Console
+from rich.markup import escape
 from rich.prompt import Confirm, Prompt
 from rich.rule import Rule
 from rich.table import Table
@@ -161,8 +162,9 @@ def ask_pw(prompt: str = "password") -> str:
 
 def header(title: str):
     console.print()
-    console.print(f"  [{C_HEAD}]>> {title}[/{C_HEAD}]")
-    console.print(f"  [{C_DIM}]{'─' * (len(title) + 4)}[/{C_DIM}]")
+    safe_title = escape(str(title))
+    console.print(f"  [{C_HEAD}]>> {safe_title}[/{C_HEAD}]")
+    console.print(f"  [{C_DIM}]{'─' * (len(str(title)) + 4)}[/{C_DIM}]")
     console.print()
 
 
@@ -421,11 +423,38 @@ class Meta:
         self._atomic_write(data)
 
     def update_master(self, salt: bytes, verify_token: str):
+        """Update master-key metadata with a recoverable meta.json backup.
+
+        SQLite and meta.json cannot be committed as one true atomic transaction.
+        This keeps a meta backup during the rewrite so a failed meta update can
+        restore the previous metadata instead of leaving the vault in a split-key
+        state.
+        """
         d = self.load()
-        d["salt"] = b64e(salt)
-        d["verify"] = verify_token
-        d["updated_at"] = utc_now()
-        self._atomic_write(d)
+        backup_path = self.path.with_suffix(".json.bak")
+
+        if self.path.exists():
+            shutil.copy2(self.path, backup_path)
+            secure_file(backup_path)
+
+        try:
+            d["salt"] = b64e(salt)
+            d["verify"] = verify_token
+            d["updated_at"] = utc_now()
+            self._atomic_write(d)
+            try:
+                if backup_path.exists():
+                    backup_path.unlink()
+            except Exception:
+                pass
+        except Exception:
+            try:
+                if backup_path.exists():
+                    os.replace(backup_path, self.path)
+                    secure_file(self.path)
+            except Exception:
+                pass
+            raise
 
 # ── database ─────────────────────────────────────────────────────────────────
 
@@ -569,6 +598,32 @@ class DB:
         d["password_hash"] = raw["password_hash"]
         return d
 
+    def _row_full_strict(self, row: sqlite3.Row) -> Dict:
+        """Strict full-row decryptor for write paths.
+
+        Unlike _row_full(), this never substitutes display sentinels such as
+        [ERR:DECRYPT]. Rekey, integrity checks, and other data-rewrite paths
+        must fail closed so credentials are never overwritten with fallback text.
+        """
+        raw = dict(row)
+        entry_uuid = raw.get("entry_uuid") or ""
+        if not entry_uuid:
+            raise ValueError(f"entry {raw.get('id')} is missing entry_uuid")
+
+        return {
+            "id": raw["id"],
+            "entry_uuid": entry_uuid,
+            "name": self.crypto.dec_field(entry_uuid, "name", raw["name"]),
+            "url": self.crypto.dec_field(entry_uuid, "url", raw["url"]) if raw.get("url") else "",
+            "login": self.crypto.dec_field(entry_uuid, "login", raw["login"]),
+            "password": self.crypto.dec_field(entry_uuid, "password", raw["password"]),
+            "notes": self.crypto.dec_field(entry_uuid, "notes", raw["notes"]) if raw.get("notes") else "",
+            "totp_secret": self.crypto.dec_field(entry_uuid, "totp_secret", raw["totp_secret"]) if raw.get("totp_secret") else "",
+            "password_hash": raw["password_hash"],
+            "created_at": raw["created_at"],
+            "updated_at": raw["updated_at"],
+        }
+
     def _safe_dec(self, entry_uuid: str, field: str, token: str, fallback: str) -> str:
         try:
             return self.crypto.dec_field(entry_uuid, field, token)
@@ -586,6 +641,8 @@ class DB:
 
     def search_summaries(self, query: str) -> List[Dict]:
         q = query.lower().strip()
+        if not q:
+            return []
         matches = []
         rows = self._db.execute("SELECT * FROM entries ORDER BY id").fetchall()
         for row in rows:
@@ -639,9 +696,10 @@ class DB:
         return eid
 
     def update(self, eid: int, **kw):
-        current = self.get_full(eid)
-        if not current:
+        row = self._db.execute("SELECT * FROM entries WHERE id=?", (eid,)).fetchone()
+        if not row:
             return
+        current = self._row_full_strict(row)
         entry_uuid = current.get("entry_uuid") or str(uuid.uuid4())
         fields = {"entry_uuid": entry_uuid, "updated_at": utc_now()}
         if "name" in kw:
@@ -709,7 +767,7 @@ class DB:
         self._db.execute("BEGIN IMMEDIATE")
         try:
             for r in rows:
-                full = self._row_full(r)
+                full = self._row_full_strict(r)
                 new_ph = new_crypto.pw_hash(full["password"])
                 self._db.execute(
                     "UPDATE entries SET name=?,url=?,login=?,password=?,notes=?,totp_secret=?,password_hash=? WHERE id=?",
@@ -741,7 +799,7 @@ class DB:
         seen_hashes = set()
         for r in rows:
             try:
-                full = self._row_full(r)
+                full = self._row_full_strict(r)
                 sc, _, _ = strength(full["password"])
                 if sc < 50:
                     result["weak"] += 1
@@ -1054,6 +1112,14 @@ class VaultTerm:
         e = self._pick(entries, "entry id to copy")
         if not e: pause(); return
         full = self.db.get_full(e["id"])
+        if not full:
+            err("entry no longer exists.")
+            pause()
+            return
+        if full.get("password") == "[ERR:DECRYPT]":
+            err("entry password could not be decrypted; refusing to copy fallback text.")
+            pause()
+            return
         pyperclip.copy(full["password"])
         ok(f"password for '{full['name']}' copied to clipboard.")
         console.print(f"  [{C_DIM}]clipboard will be cleared in {CLIPBOARD_CLEAR_SECONDS} seconds.[/{C_DIM}]\n")
@@ -1063,9 +1129,14 @@ class VaultTerm:
         e = self._pick(entries, "entry id to view")
         if not e: pause(); return
         full = self.db.get_full(e["id"])
+        if not full:
+            err("entry no longer exists.")
+            pause()
+            return
         sc, label, color = strength(full["password"])
         sep = f"  [{C_DIM}]{'─' * 58}[/{C_DIM}]"
-        def row(k, v, vc=C_DATA): console.print(f"  [{C_DIM}]{k:<10}[/{C_DIM}]  [{vc}]{v}[/{vc}]")
+        def row(k, v, vc=C_DATA):
+            console.print(f"  [{C_DIM}]{escape(str(k)):<10}[/{C_DIM}]  [{vc}]{escape(str(v))}[/{vc}]")
         console.print(); console.print(sep)
         row("ID", str(full["id"]), C_DIM); row("NAME", full["name"]); row("URL", full.get("url") or "—", C_DIM)
         row("LOGIN", full["login"], C_LABEL); row("PASSWORD", "[hidden]", C_DIM)
@@ -1095,6 +1166,10 @@ class VaultTerm:
     def cmd_search(self):
         banner(); header("SEARCH")
         q = Prompt.ask(f"  [{C_HEAD}]query[/{C_HEAD}]")
+        if not q.strip():
+            warn("empty query.")
+            pause()
+            return
         results = self.db.search_summaries(q)
         if not results:
             warn(f"no results for: {q}"); pause(); return
@@ -1125,8 +1200,8 @@ class VaultTerm:
                 inf("aborted."); pause(); return
         pw = self._password_input_flow()
         if pw is None: pause(); return
-        console.print(); console.print(f"  [{C_DIM}]NAME[/{C_DIM}]  {name}")
-        console.print(f"  [{C_DIM}]LOGIN[/{C_DIM}] {login}")
+        console.print(); console.print(f"  [{C_DIM}]NAME[/{C_DIM}]  {escape(str(name))}")
+        console.print(f"  [{C_DIM}]LOGIN[/{C_DIM}] {escape(str(login))}")
         console.print(f"  [{C_DIM}]PASS[/{C_DIM}]  {'*' * len(pw)} ({len(pw)} chars)")
         if Confirm.ask("  commit to vault?", default=True):
             # FIX 7: pass totp_secret directly — _totp_input() already applies
@@ -1146,7 +1221,11 @@ class VaultTerm:
         e = self._pick(entries, "entry id to modify")
         if not e: pause(); return
         full = self.db.get_full(e["id"])
-        console.print(f"\n  modifying [{C_HEAD}]{full['name']}[/{C_HEAD}]")
+        if not full:
+            err("entry no longer exists.")
+            pause()
+            return
+        console.print(f"\n  modifying [{C_HEAD}]{escape(str(full['name']))}[/{C_HEAD}]")
         console.print(f"  [{C_DIM}](press ENTER to keep current value)[/{C_DIM}]\n")
         updates = {
             "name": Prompt.ask(f"  [{C_HEAD}]name[/{C_HEAD}]", default=full["name"]),
@@ -1301,6 +1380,10 @@ class VaultTerm:
         e = self._pick(entries, "entry id for TOTP")
         if not e: pause(); return
         full = self.db.get_full(e["id"])
+        if not full:
+            err("entry no longer exists.")
+            pause()
+            return
         if not full.get("totp_secret"):
             warn("entry has no TOTP secret."); pause(); return
         try:
@@ -1337,7 +1420,7 @@ class VaultTerm:
         _RESET = "\033[0m"
 
         console.print(
-            f"\n  [{C_DIM}]live TOTP for[/{C_DIM}] [{C_HEAD}]{name}[/{C_HEAD}]"
+            f"\n  [{C_DIM}]live TOTP for[/{C_DIM}] [{C_HEAD}]{escape(str(name))}[/{C_HEAD}]"
             f"  [{C_DIM}]-- press ENTER to exit[/{C_DIM}]\n"
         )
 
@@ -1389,13 +1472,15 @@ class VaultTerm:
         sys.stdout.flush()
         console.print()
 
-        # Offer clipboard copy of the last displayed code
+        # Offer clipboard copy of the last displayed code. Do not call pause() here:
+        # the Enter key used to exit the live view was already consumed by the
+        # stdin watcher, so another pause would force an unnecessary second Enter.
         if last_code and self._clipboard_allowed() and _CLIP:
             if Confirm.ask(f"  copy [{last_code}] to clipboard?", default=False):
                 pyperclip.copy(last_code)
                 _clip_clear(last_code)
                 ok("code copied.")
-        pause()
+        console.print()
 
     def cmd_log(self):
         banner(); header("AUDIT LOG")
@@ -1424,6 +1509,17 @@ class VaultTerm:
             if len(new) < 12: err("too short."); continue
             new2 = ask_pw("confirm new master password")
             if new != new2: err("mismatch."); continue
+            try:
+                dead_raw = Crypto.derive(new, b64d(md["deadman_salt"]), md["kdf"])
+                deadman_same = (
+                    Crypto.verify_with_raw(dead_raw, md["deadman_verify"], DEADMAN_SENTINEL, aad_for_meta("deadman_verify"))
+                    or Crypto.legacy_verify_with_raw(dead_raw, md["deadman_verify"], DEADMAN_SENTINEL)
+                )
+            except Exception:
+                deadman_same = False
+            if deadman_same:
+                err("master and deadman passwords must be different.")
+                continue
             sc, label, color = strength(new)
             console.print(f"\n  strength  ", end=""); console.print(strength_bar(sc), end=""); console.print(f"  [{color}]{label}[/{color}] ({sc}/100)\n")
             if sc < 50 and not Confirm.ask("  weak password -- continue?", default=False): continue
