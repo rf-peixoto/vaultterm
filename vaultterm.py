@@ -47,7 +47,7 @@ except Exception:
 
 # ── user-tunable settings ─────────────────────────────────────────────────────
 
-VERSION = "3.0"
+VERSION = "3.0-hardened"
 SCHEMA_VERSION = 4
 VAULT_DIR = Path.home() / ".vaultterm"
 DB_PATH = VAULT_DIR / "vault.db"
@@ -559,9 +559,13 @@ class DB:
         d = self._row_summary(row)
         raw = dict(row)
         entry_uuid = raw.get("entry_uuid") or d.get("entry_uuid") or ""
-        d["password"] = self.crypto.dec_field(entry_uuid, "password", raw["password"])
-        d["notes"] = self.crypto.dec_field(entry_uuid, "notes", raw["notes"]) if raw.get("notes") else ""
-        d["totp_secret"] = self.crypto.dec_field(entry_uuid, "totp_secret", raw["totp_secret"]) if raw.get("totp_secret") else ""
+        # FIX 3: wrap every dec_field call in _safe_dec so that a single corrupt
+        # or tampered entry cannot raise an unhandled exception in callers like
+        # _copy, _view, _quick_update, and _totp_for.  Previously only health()
+        # wrapped _row_full; every other caller would crash on bad data.
+        d["password"]    = self._safe_dec(entry_uuid, "password",    raw["password"],    "[ERR:DECRYPT]")
+        d["notes"]       = self._safe_dec(entry_uuid, "notes",       raw["notes"],       "") if raw.get("notes") else ""
+        d["totp_secret"] = self._safe_dec(entry_uuid, "totp_secret", raw["totp_secret"], "") if raw.get("totp_secret") else ""
         d["password_hash"] = raw["password_hash"]
         return d
 
@@ -647,8 +651,11 @@ class DB:
             old_hash = current["password_hash"]
             fields["password"] = self.crypto.enc_field(entry_uuid, "password", kw["password"])
             fields["password_hash"] = self.crypto.pw_hash(kw["password"])
+            # Store only the replaced password hash. The current password hash
+            # remains in entries.password_hash and is checked there first by
+            # password_was_used(), so inserting the new hash here would waste
+            # history depth.
             self._db.execute("INSERT INTO password_history (entry_id,password_hash,changed_at) VALUES (?,?,?)", (eid, old_hash, utc_now()))
-            self._db.execute("INSERT INTO password_history (entry_id,password_hash,changed_at) VALUES (?,?,?)", (eid, fields["password_hash"], utc_now()))
         clause = ", ".join(f"{k}=?" for k in fields)
         self._db.execute(f"UPDATE entries SET {clause} WHERE id=?", [*fields.values(), eid])
         self._log("EDIT", eid)
@@ -680,6 +687,8 @@ class DB:
     def auto_lock_seconds(self) -> int:
         try:
             minutes = int(self.setting("auto_lock_minutes", "10"))
+            if minutes <= 0:
+                return 0
             return minutes * 60
         except Exception:
             return AUTO_LOCK_SECONDS
@@ -706,8 +715,13 @@ class DB:
                 self._db.execute("INSERT INTO password_history (entry_id,password_hash,changed_at) VALUES (?,?,?)", (full["id"], new_ph, utc_now()))
             self._log("REKEY", None)
             verify = new_crypto.enc(SENTINEL, aad_for_meta("verify"))
-            meta.update_master(new_salt, verify)
+            # FIX 1: commit the database first, then update the meta file.
+            # The original code wrote the meta before committing, meaning a
+            # failed commit would leave the meta pointing to the new key while
+            # the database still held data encrypted under the old key —
+            # silently corrupting the vault beyond recovery.
             self._db.commit()
+            meta.update_master(new_salt, verify)
         except Exception:
             self._db.rollback()
             raise
@@ -762,13 +776,17 @@ def gen_pw(length: int = 24, profile: str = "high") -> str:
 
 
 def gen_passphrase(words_count: int = 5) -> str:
+    # FIX 5: clamp to the documented 4-8 word range.  Previously only a
+    # minimum of 4 was enforced (silently); there was no upper bound, so
+    # passing an arbitrary integer produced an arbitrarily long passphrase.
+    words_count = max(4, min(8, words_count))
     words = [
         "amber", "anchor", "atlas", "binary", "black", "cinder", "cipher", "cobalt", "comet", "crimson",
         "delta", "ember", "falcon", "forest", "ghost", "granite", "harbor", "helium", "iron", "ivory",
         "jaguar", "kernel", "lunar", "matrix", "nebula", "onyx", "orbit", "phoenix", "quantum", "raven",
         "signal", "silver", "storm", "temple", "umbra", "vector", "velvet", "vortex", "winter", "zenith",
     ]
-    return "-".join(secrets.choice(words) for _ in range(max(4, words_count))) + "-" + str(secrets.randbelow(9000) + 1000)
+    return "-".join(secrets.choice(words) for _ in range(words_count)) + "-" + str(secrets.randbelow(9000) + 1000)
 
 
 def strength(pw: str) -> Tuple[int, str, str]:
@@ -779,9 +797,12 @@ def strength(pw: str) -> Tuple[int, str, str]:
     if len(pw) >= 20: s += 10
     if len(pw) >= 32: s += 10
     if len(pw) >= 64: s += 10
-    if any(c.islower() for c in pw): s += 8
+    # FIX 6: lowercase and uppercase contribute identical entropy per character,
+    # so both bonuses are now +10.  The original code awarded +8 for lowercase
+    # and +10 for uppercase, unfairly penalising all-lowercase passwords.
+    if any(c.islower() for c in pw): s += 10
     if any(c.isupper() for c in pw): s += 10
-    if any(c.isdigit() for c in pw): s += 12
+    if any(c.isdigit() for c in pw): s += 10
     if any(c in "!@#$%^&*-_=+[]{}|;:,.<>?" for c in pw): s += 20
     s = min(s, 100)
     if s < 30: return s, "CRITICAL", C_ERR
@@ -816,12 +837,22 @@ class VaultTerm:
         self.last_activity = time.monotonic()
 
     def check_timeout(self):
-        if self.db and time.monotonic() - self.last_activity > self.db.auto_lock_seconds:
-            if self.db:
-                self.db.close()
+        if not self.db:
+            return
+        auto_lock_seconds = self.db.auto_lock_seconds
+        if auto_lock_seconds <= 0:
+            return
+        if time.monotonic() - self.last_activity > auto_lock_seconds:
+            self.db.close()
+            self.db = None
             clr()
             warn("session locked due to inactivity.")
-            sys.exit(0)
+            # FIX 4: re-authenticate rather than terminating the process.
+            # The original code called sys.exit(0), which contradicts the
+            # documented behaviour ("re-authentication is required") and forces
+            # the user to re-launch the application after every idle timeout.
+            self._unlock()
+            self.touch()
 
     def start(self):
         set_permissions()
@@ -871,10 +902,16 @@ class VaultTerm:
             pw = ask_pw("master password")
             try:
                 raw = Crypto.derive(pw, b64d(md["salt"]), params)
-                if Crypto.verify_with_raw(raw, md["verify"], SENTINEL, aad_for_meta("verify")) or Crypto.legacy_verify_with_raw(raw, md["verify"], SENTINEL):
+                master_ok    = Crypto.verify_with_raw(raw, md["verify"], SENTINEL, aad_for_meta("verify"))
+                # FIX 8: cache the legacy result so we don't call it twice.
+                # The original code evaluated legacy_verify_with_raw in the outer
+                # `or` condition and then called it again in the upgrade block,
+                # performing an unnecessary decryption on every login attempt.
+                master_legacy = not master_ok and Crypto.legacy_verify_with_raw(raw, md["verify"], SENTINEL)
+                if master_ok or master_legacy:
                     self.crypto.init_from_raw(raw)
                     try:
-                        if Crypto.legacy_verify_with_raw(raw, md["verify"], SENTINEL):
+                        if master_legacy:
                             self.meta.update_master(b64d(md["salt"]), self.crypto.enc(SENTINEL, aad_for_meta("verify")))
                     except Exception:
                         pass
@@ -1085,7 +1122,11 @@ class VaultTerm:
         console.print(f"  [{C_DIM}]LOGIN[/{C_DIM}] {login}")
         console.print(f"  [{C_DIM}]PASS[/{C_DIM}]  {'*' * len(pw)} ({len(pw)} chars)")
         if Confirm.ask("  commit to vault?", default=True):
-            eid = self.db.add(name, url, login, pw, notes, totp_secret.strip().replace(" ", ""))
+            # FIX 7: pass totp_secret directly — _totp_input() already applies
+            # .strip().replace(" ", "").upper().  The extra sanitisation here was
+            # redundant and misleading (the .upper() from _totp_input had already
+            # been applied; a second .replace(" ","") on the result did nothing).
+            eid = self.db.add(name, url, login, pw, notes, totp_secret)
             ok(f"entry injected. id={eid}")
         else: inf("aborted.")
         pause()
@@ -1154,9 +1195,17 @@ class VaultTerm:
         while True:
             profile = self._profile_prompt()
             if profile == "passphrase":
-                raw = Prompt.ask(f"  [{C_HEAD}]words[/{C_HEAD}]", default="5")
-                try: words = int(raw)
-                except ValueError: words = 5
+                raw = Prompt.ask(f"  [{C_HEAD}]words[/{C_HEAD}] [{C_DIM}](4-8)[/{C_DIM}]", default="5")
+                try:
+                    words = int(raw)
+                except ValueError:
+                    words = 5
+                # FIX 5b: inform the user when their requested count is outside
+                # the 4-8 range before silently clamping it.
+                if not (4 <= words <= 8):
+                    clamped = max(4, min(8, words))
+                    warn(f"word count clamped to {clamped} (valid range: 4-8).")
+                    words = clamped
                 pw = gen_passphrase(words)
             else:
                 raw = Prompt.ask(f"  [{C_HEAD}]length[/{C_HEAD}] [{C_DIM}]({PW_MIN_LEN}-{PW_MAX_LEN})[/{C_DIM}]", default="24")
@@ -1174,12 +1223,20 @@ class VaultTerm:
             if Confirm.ask("  use this password?", default=True):
                 return pw
 
-    def _manual_pw(self) -> Optional[str]:
+    def _manual_pw(self) -> str:
+        # FIX 2a: return type corrected from Optional[str] to str — this loop
+        # only exits via `return p1`; it never returns None.
         while True:
             p1 = ask_pw("new password")
             p2 = ask_pw("confirm password")
             if p1 != p2:
                 err("mismatch."); continue
+            # FIX 2b: enforce the same 12-character minimum that _init_vault and
+            # cmd_rekey use.  Previously _manual_pw (called by INJECT and MODIFY)
+            # had no length check, so a user could set an empty or trivially short
+            # password — only a soft strength-score warning stood in the way.
+            if len(p1) < 12:
+                err("password too short. minimum 12 characters."); continue
             sc, label, color = strength(p1)
             console.print(f"\n  [{C_DIM}]strength   [/{C_DIM}]", end=""); console.print(strength_bar(sc), end="")
             console.print(f"  [{color}]{label}[/{color}] ({sc}/100)\n")
