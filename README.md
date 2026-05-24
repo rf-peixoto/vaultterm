@@ -19,9 +19,9 @@ No cloud, no accounts, no telemetry. One Python file, one SQLite database.
 | KDF | Argon2id (256 MB, t=3, p=2) | Memory-hard. Raises the cost of GPU/ASIC brute-force against the master password. |
 | Key split | 64-byte Argon2id output → `enc_key[:32]` + `hash_key[32:]` | Encryption and HMAC operations never share a key. |
 | Scope | Field-level | `name`, `url`, `login`, `password`, `notes`, `totp_secret` each carry their own nonce. |
-| AAD | `b"vaultterm-v3"` | Domain-binds every ciphertext so tokens cannot be replayed across versions or contexts. |
+| AAD | `vaultterm\|schema=4\|entry\|{uuid}\|field\|{field}` | Every ciphertext is domain-bound to the schema version, the specific entry UUID, and the field name. A token from one entry or field cannot be replayed to another. |
 | Password history | HMAC-SHA256 keyed with `hash_key` | Prior passwords are stored as keyed hashes — reuse detection without exposing plaintext. |
-| File permissions | `0700` (vault dir) · `0600` (db, meta, backups) | Enforced on Linux and macOS. Not enforced on Windows. |
+| File permissions | `0700` (vault dir) · `0600` (db, meta, backups) | Enforced on Linux and macOS. Best-effort `icacls` ACL hardening on Windows (not a substitute for a hardened host). |
 | Deadman | Independent Argon2id derivation + independent sentinel | Triggers silently at login. Shreds the vault and exits with a fake corruption message. |
 
 Nothing leaves the machine.
@@ -89,7 +89,7 @@ You will be asked to set two passwords before the vault is created.
 [9]  CLONE     create encrypted backup archive
 [10] TOTP      live TOTP code display with countdown
 [11] HEALTH    vault health and security report
-[12] SETTINGS  configure expiry threshold and auto-lock timeout
+[12] SETTINGS  configure expiry threshold, auto-lock timeout, and clipboard
 [0]  EJECT     lock vault and exit
 ```
 
@@ -118,7 +118,9 @@ Pressing `Ctrl+C` inside any command cancels it and returns to this menu. It doe
 
 ## Copying a password
 
-From the list view, press `[C]` and enter the entry ID. The password is decrypted, sent to the clipboard, and **never printed to the terminal**. The clipboard is automatically cleared after 30 seconds.
+Clipboard access is **disabled by default** and must be explicitly enabled in `[12] SETTINGS` (`clipboard_enabled = 1`). This is a deliberate security default — only enable it if your local threat model permits clipboard use.
+
+Once enabled, press `[C]` from the list view and enter the entry ID. The password is decrypted, sent to the clipboard, and **never printed to the terminal**. The clipboard is automatically cleared after 30 seconds.
 
 ---
 
@@ -138,13 +140,13 @@ During `INJECT` or `MODIFY`, paste the base32 string from your authenticator app
   681289  [##########################....]  4s
 ```
 
-The display updates every 0.5 seconds. The countdown bar depletes left to right as the 30-second window drains:
+The display updates every 0.5 seconds. The progress bar shows remaining time as a filled segment that shrinks from right to left as the 30-second window drains:
 
 - Bar **green**, code **cyan** when time is comfortable
 - Bar **yellow** when ≤ 10 seconds remain
 - Bar **red**, code **red** when ≤ 5 seconds remain — the **next** code appears in yellow so you have it ready before the current one expires
 
-Press `Enter` to exit the live display. The last visible code can be optionally copied to clipboard before returning to the menu.
+Press `Enter` to exit the live display. If clipboard is enabled, the last visible code can be optionally copied to clipboard before returning to the menu.
 
 `[T]` in the list action bar triggers the same live display for any entry with a TOTP secret.
 
@@ -196,7 +198,7 @@ Every password change pushes the previous password's HMAC-SHA256 hash to a histo
 
 ## Changing the master password — `[8] REKEY`
 
-Re-encryption is atomic. All row updates run inside a single `BEGIN IMMEDIATE` transaction. The meta file is only written after the database commits successfully. If anything fails mid-operation, the database rolls back and the meta file is untouched — the vault is either fully re-encrypted under the new key or entirely unchanged under the old one.
+Re-encryption is atomic. All row updates run inside a single `BEGIN IMMEDIATE` transaction. The meta file is only written after the database commits successfully. During the meta file update, a `.json.bak` copy of the previous meta is kept as a recovery fallback — if the meta write fails, the backup is restored automatically so the vault is never left in a split-key state. If anything fails mid-operation, the database rolls back and the meta file is untouched — the vault is either fully re-encrypted under the new key or entirely unchanged under the old one.
 
 ---
 
@@ -210,13 +212,13 @@ If the deadman password is entered at the login prompt:
 
 No output distinguishes a deadman trigger from a genuine corruption error. The master password is always checked first; the deadman is only checked if the master fails. The resulting timing difference (one vs. two Argon2id derivations, roughly 0.5–2 seconds) is not meaningful in the coercion scenario this feature is designed for.
 
-> **SSD caveat.** Overwrite-based shredding is not guaranteed on SSDs due to wear leveling and flash translation layers. For reliable physical deniability, full-disk encryption (LUKS, FileVault, BitLocker) is the appropriate layer.
+> **SSD caveat.** Overwrite-based shredding is unreliable on journaling filesystems (ext4, NTFS), copy-on-write filesystems (APFS, Btrfs, ZFS), and any SSD or NVMe drive with wear-levelling or over-provisioning. The OS or hardware may redirect overwrite writes to new physical blocks, leaving the original data recoverable elsewhere on the medium. For reliable physical deniability, full-disk encryption (LUKS, FileVault, BitLocker) is the appropriate layer.
 
 ---
 
 ## Backups — `[9] CLONE`
 
-Creates a `.tar.gz` archive of `vault.db` and `meta.json` inside `~/.vaultterm/backups/`, timestamped and set to `0600`. Both files are required to restore — the database without the meta file cannot be decrypted.
+Creates a `.tar.gz` archive of `vault.db` and `meta.json` inside `~/.vaultterm/backups/`, timestamped and set to `0600`. After writing, the archive is immediately re-opened and verified — if the file is unreadable or empty, an error is reported before claiming success. Both files are required to restore — the database without the meta file cannot be decrypted.
 
 To restore: extract both files into `~/.vaultterm/` and launch normally.
 
@@ -224,7 +226,7 @@ To restore: extract both files into `~/.vaultterm/` and launch normally.
 
 ## Auto-lock
 
-The session locks after a configurable period of inactivity (default 10 minutes). The check fires at the start of each menu loop — it does not interrupt you mid-input. When triggered, the database connection is closed and re-authentication is required. Set to `0` to disable.
+The session locks after a configurable period of inactivity (default 10 minutes). The check fires at the start of each menu loop — it does not interrupt you mid-input. When triggered, the database connection is closed and re-authentication is required without restarting the application. Set to `0` to disable.
 
 ---
 
@@ -252,6 +254,7 @@ Stored in the `settings` table inside `vault.db`. Persist across sessions. Appli
 |---|---|---|
 | `expiry_days` | `30` | Days before a password is flagged `[EXPIRED]`. Minimum 1. |
 | `auto_lock_minutes` | `10` | Minutes of inactivity before the session locks. Set to `0` to disable. |
+| `clipboard_enabled` | `0` | Enables clipboard operations (`[C] copy`, TOTP copy). `0` = disabled, `1` = enabled. Disabled by default — only enable if your threat model permits it. |
 
 ---
 
@@ -270,7 +273,7 @@ Stored in the `settings` table inside `vault.db`. Persist across sessions. Appli
 ```json
 {
   "version": "3.0",
-  "schema_version": 3,
+  "schema_version": 4,
   "cipher": "ChaCha20Poly1305",
   "kdf": {
     "type": "argon2id",
@@ -296,7 +299,7 @@ Stored in the `settings` table inside `vault.db`. Persist across sessions. Appli
 ```
 entries          one row per credential; all sensitive columns are encrypted blobs
 password_history HMAC-SHA256 hashes of previous passwords per entry (no plaintext)
-log              action code + entry ID only; no sensitive content
+log              action code + entry ID only; no sensitive content; last 80 entries shown
 settings         per-vault key/value configuration
 ```
 
@@ -318,7 +321,8 @@ All installed into `.venv` by `install.sh`. No system-wide installation.
 
 ## Known limitations
 
-- **SSD shredding is not guaranteed.** See deadman caveat.
+- **SSD shredding is not guaranteed.** Overwrite-based deletion is unreliable on journaling and copy-on-write filesystems and any SSD with wear-levelling. Full-disk encryption is the only reliable mitigation.
+- **Clipboard is disabled by default.** It must be explicitly enabled in `[12] SETTINGS`. Once enabled, passwords are cleared from the clipboard automatically after 30 seconds, but this relies on `pyperclip` being able to read the current clipboard contents — it may not work in all environments.
 - **Password history is cleared on rekey.** HMAC hashes are key-bound and cannot survive a master password change without storing plaintext.
 - **Windows clipboard auto-clear** may not work without a compatible clipboard utility installed.
 - **Auto-lock fires at menu boundaries**, not mid-input. It does not interrupt active typing.
