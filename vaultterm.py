@@ -113,7 +113,11 @@ def parse_ts(ts: str) -> datetime:
             d = d.replace(tzinfo=timezone.utc)
         return d
     except Exception:
-        return datetime.now(timezone.utc)
+        # Return the earliest representable UTC datetime so that a corrupt or
+        # tampered timestamp is treated as maximally old rather than brand-new.
+        # This ensures age_days() returns a large value and expiry checks never
+        # silently suppress a stale entry because of an unreadable timestamp.
+        return datetime.min.replace(tzinfo=timezone.utc)
 
 
 def local_date(ts: str) -> str:
@@ -223,6 +227,18 @@ def set_permissions():
 
 
 def secure_delete_file(path: Path, passes: int = 3):
+    """Attempt to overwrite and then unlink a file.
+
+    WARNING - UNRELIABLE ON MODERN STORAGE:
+    On journaling filesystems (ext4, NTFS), copy-on-write filesystems (APFS,
+    Btrfs, ZFS), and any SSD or NVMe drive with wear-levelling or over-
+    provisioning, the OS or hardware may redirect overwrite writes to new
+    physical blocks, leaving the original data intact elsewhere on the medium.
+    This function is therefore a best-effort measure only.  The only reliable
+    protection for data at rest is full-disk encryption (e.g. LUKS, FileVault,
+    BitLocker).  Do not rely on this routine as your sole protection against
+    forensic recovery of vault material.
+    """
     try:
         if not path.exists() or not path.is_file():
             return
@@ -700,7 +716,9 @@ class DB:
         if not row:
             return
         current = self._row_full_strict(row)
-        entry_uuid = current.get("entry_uuid") or str(uuid.uuid4())
+        # _row_full_strict() raises ValueError if entry_uuid is empty, so
+        # current["entry_uuid"] is always a non-empty string here.
+        entry_uuid = current["entry_uuid"]
         fields = {"entry_uuid": entry_uuid, "updated_at": utc_now()}
         if "name" in kw:
             fields["name"] = self.crypto.enc_field(entry_uuid, "name", kw["name"])
@@ -991,7 +1009,16 @@ class VaultTerm:
                     shred_vault()
                     console.print(f"\n  [{C_ERR}][ERR][/{C_ERR}] database corrupted. unable to recover vault state.\n")
                     sys.exit(2)
+            except (MemoryError, OSError, SystemError) as _unexpected:
+                # These exceptions are not wrong-password failures; surface
+                # them immediately so the user knows something went wrong
+                # beyond a simple authentication error (e.g. OOM, I/O error,
+                # or Argon2 library failure).
+                err(f"unexpected error during unlock: {escape(str(_unexpected))}")
+                sys.exit(3)
             except Exception:
+                # Any other exception (e.g. bad base64 in meta, decryption
+                # error) is treated as a wrong-password attempt.
                 pass
             left = MAX_ATTEMPTS - attempt - 1
             if left:
@@ -1121,7 +1148,7 @@ class VaultTerm:
             pause()
             return
         pyperclip.copy(full["password"])
-        ok(f"password for '{full['name']}' copied to clipboard.")
+        ok(f"password for '{escape(full['name'])}' copied to clipboard.")
         console.print(f"  [{C_DIM}]clipboard will be cleared in {CLIPBOARD_CLEAR_SECONDS} seconds.[/{C_DIM}]\n")
         _clip_clear(full["password"]); pause()
 
@@ -1136,24 +1163,29 @@ class VaultTerm:
         sc, label, color = strength(full["password"])
         sep = f"  [{C_DIM}]{'─' * 58}[/{C_DIM}]"
         def row(k, v, vc=C_DATA):
-            console.print(f"  [{C_DIM}]{escape(str(k)):<10}[/{C_DIM}]  [{vc}]{escape(str(v))}[/{vc}]")
+            # Escaping of `v` is the caller's responsibility: plain user data
+            # must be pre-escaped with escape(); values that contain intentional
+            # Rich markup (e.g. the TOTP subrow) must be passed as-is.
+            console.print(f"  [{C_DIM}]{escape(str(k)):<10}[/{C_DIM}]  [{vc}]{v}[/{vc}]")
         console.print(); console.print(sep)
-        row("ID", str(full["id"]), C_DIM); row("NAME", full["name"]); row("URL", full.get("url") or "—", C_DIM)
-        row("LOGIN", full["login"], C_LABEL); row("PASSWORD", "[hidden]", C_DIM)
-        if Confirm.ask("  reveal password once on screen?", default=False): row("PASSWORD", full["password"], C_PW)
+        row("ID", str(full["id"]), C_DIM); row("NAME", escape(full["name"])); row("URL", escape(full.get("url") or "—"), C_DIM)
+        row("LOGIN", escape(full["login"]), C_LABEL); row("PASSWORD", "[hidden]", C_DIM)
+        if Confirm.ask("  reveal password once on screen?", default=False): row("PASSWORD", escape(full["password"]), C_PW)
         row("CREATED", local_date(full["created_at"]), C_DIM); row("UPDATED", local_date(full["updated_at"]), C_DIM)
         row("AGE", f"{full['age']} day(s)", C_ERR if full["expired"] else C_DIM)
-        if full.get("notes"): row("NOTES", full["notes"], C_DIM)
+        if full.get("notes"): row("NOTES", escape(full["notes"]), C_DIM)
         if full.get("totp_secret") and pyotp is not None:
             try:
                 totp_obj  = pyotp.TOTP(full["totp_secret"])
                 remaining = totp_obj.interval - (int(time.time()) % totp_obj.interval)
                 code      = totp_obj.now()
                 code_color = C_ERR if remaining <= 5 else (C_WARN if remaining <= 10 else C_PW)
+                # `code` is pure digits; the trailing annotation is intentional Rich
+                # markup — do NOT escape this value.
                 row("TOTP", f"{code}  [{C_DIM}]({remaining}s remaining — use [10] for live display)[/{C_DIM}]", code_color)
                 if remaining <= 5:
                     next_code = totp_obj.at(time.time() + remaining + 1)
-                    row("TOTP NEXT", next_code, C_WARN)
+                    row("TOTP NEXT", escape(str(next_code)), C_WARN)
             except Exception:
                 row("TOTP", "[invalid secret]", C_ERR)
         elif full.get("totp_secret"):
@@ -1172,7 +1204,7 @@ class VaultTerm:
             return
         results = self.db.search_summaries(q)
         if not results:
-            warn(f"no results for: {q}"); pause(); return
+            warn(f"no results for: {escape(q)}"); pause(); return
         self.cmd_list(results, title=f"SEARCH >> {q} ({len(results)} match(es))")
 
     def _password_input_flow(self, eid: Optional[int] = None) -> Optional[str]:
@@ -1244,8 +1276,12 @@ class VaultTerm:
                 warn("this password appears in this entry's password history.")
                 if Confirm.ask("  use it anyway?", default=False): updates["password"] = pw
             elif pw: updates["password"] = pw
-        self.db.update(e["id"], **updates)
-        ok(f"entry {e['id']} modified."); pause()
+        try:
+            self.db.update(e["id"], **updates)
+            ok(f"entry {e['id']} modified.")
+        except Exception as ex:
+            err(f"failed to update entry {e['id']}: {escape(str(ex))}")
+        pause()
 
     def _quick_update(self, entries: List[Dict]):
         e = self._pick(entries, "entry id to update password")
@@ -1253,7 +1289,7 @@ class VaultTerm:
         pw = self._password_input_flow(e["id"])
         if pw is None: pause(); return
         self.db.update(e["id"], password=pw)
-        ok(f"password updated for '{e['name']}'."); pause()
+        ok(f"password updated for '{escape(e['name'])}'."); pause()
 
     def cmd_purge(self):
         banner(); header("PURGE -- DELETE ENTRY")
@@ -1262,7 +1298,7 @@ class VaultTerm:
         console.print(self._entry_table(entries)); console.print()
         e = self._pick(entries, "entry id to purge")
         if not e: pause(); return
-        console.print(f"\n  [{C_ERR}]target: {e['name']} ({e['login']})[/{C_ERR}]")
+        console.print(f"\n  [{C_ERR}]target: {escape(e['name'])} ({escape(e['login'])})[/{C_ERR}]")
         if Confirm.ask("  confirm purge?", default=False):
             self.db.delete(e["id"]); ok(f"entry {e['id']} purged.")
         else: inf("aborted.")
@@ -1545,7 +1581,20 @@ class VaultTerm:
             if DB_PATH.exists(): tar.add(DB_PATH, arcname="vault.db")
             if META_PATH.exists(): tar.add(META_PATH, arcname="meta.json")
         secure_file(out)
-        ok(f"backup written:\n  {out}")
+        # Integrity check: re-open the archive and list its members to confirm
+        # the file was written completely and is readable.  A corrupt or
+        # truncated archive should be caught here rather than at restore time.
+        try:
+            with tarfile.open(out, "r:gz") as verify_tar:
+                members = verify_tar.getnames()
+            if not members:
+                raise ValueError("archive contains no members")
+        except Exception as ex:
+            err(f"backup verification failed -- archive may be corrupt: {escape(str(ex))}")
+            warn(f"the file has been left at {out} for manual inspection.")
+            pause()
+            return
+        ok(f"backup written and verified ({len(members)} file(s)):\n  {out}")
         warn("keep this archive safe. it contains encrypted vault material and metadata.")
         pause()
 
