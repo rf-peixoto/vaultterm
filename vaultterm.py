@@ -472,6 +472,15 @@ class Meta:
                 pass
             raise
 
+    def replace(self, data: Dict):
+        """Atomically overwrite meta.json with a known-good snapshot.
+
+        Used as the compensating action during rekey: if the SQLite commit
+        fails *after* the new metadata was written, the caller restores the
+        pre-rekey metadata snapshot so both stores stay on the old key.
+        """
+        self._atomic_write(data)
+
 # ── database ─────────────────────────────────────────────────────────────────
 
 
@@ -719,7 +728,7 @@ class DB:
         # _row_full_strict() raises ValueError if entry_uuid is empty, so
         # current["entry_uuid"] is always a non-empty string here.
         entry_uuid = current["entry_uuid"]
-        fields = {"entry_uuid": entry_uuid, "updated_at": utc_now()}
+        fields = {"entry_uuid": entry_uuid}
         if "name" in kw:
             fields["name"] = self.crypto.enc_field(entry_uuid, "name", kw["name"])
         if "url" in kw:
@@ -734,6 +743,12 @@ class DB:
             old_hash = current["password_hash"]
             fields["password"] = self.crypto.enc_field(entry_uuid, "password", kw["password"])
             fields["password_hash"] = self.crypto.pw_hash(kw["password"])
+            # FIX 11: updated_at drives age/[EXPIRED] and the "not rotated in
+            # N+ days" alert, so it must track *password rotation*, not any
+            # edit. Previously every metadata edit (name, url, notes, TOTP)
+            # reset updated_at, silently un-expiring stale passwords without
+            # them ever being changed.
+            fields["updated_at"] = utc_now()
             # Store only the replaced password hash. The current password hash
             # remains in entries.password_hash and is checked there first by
             # password_was_used(), so inserting the new hash here would waste
@@ -781,8 +796,65 @@ class DB:
         return [dict(r) for r in rows]
 
     def reencrypt_atomic(self, new_crypto: Crypto, new_salt: bytes, meta: Meta):
+        """Re-encrypt every entry under a new master key.
+
+        SQLite and meta.json cannot be committed as one true atomic unit, so
+        this is a two-phase update ordered to make every failure recoverable:
+
+          1. Snapshot the pre-rekey DB file and metadata to BACKUP_DIR
+             (disaster-recovery escape hatch, removed on any consistent
+             outcome).
+          2. Rewrite all rows inside an open (uncommitted) transaction.
+          3. Write the NEW metadata. update_master() keeps its own .bak and
+             self-restores on failure, so if this step fails we roll the DB
+             back and everything is still on the old key.
+          4. Commit the DB last. The compensating action for a commit
+             failure — rewriting the small meta.json we successfully wrote
+             moments earlier with the old snapshot — is trivial and near
+             certain to succeed, unlike the previous order where a failed
+             meta update followed an irreversible commit and left the vault
+             in the split-key state (DB under the new key, meta deriving the
+             old one).
+
+        Only if BOTH the commit and the meta restore fail is the vault left
+        inconsistent, and in that case the step-1 snapshots are kept and
+        their paths are reported for manual recovery.
+        """
+        old_meta = meta.load()
+
+        # 1. disaster-recovery snapshots (old-key material; deleted on any
+        #    consistent outcome, securely, since they undermine the rekey)
+        secure_mkdir(BACKUP_DIR)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        db_snap = BACKUP_DIR / f"prerekey_{ts}_vault.db"
+        meta_snap = BACKUP_DIR / f"prerekey_{ts}_meta.json"
+        shutil.copy2(self.path, db_snap)
+        shutil.copy2(meta.path, meta_snap)
+        secure_file(db_snap)
+        secure_file(meta_snap)
+
+        def _discard_snapshots():
+            secure_delete_file(db_snap)
+            secure_delete_file(meta_snap)
+
         rows = self._db.execute("SELECT * FROM entries").fetchall()
         self._db.execute("BEGIN IMMEDIATE")
+
+        def _restore_old_meta_or_die(cause: Exception):
+            """Force meta.json back to the pre-rekey snapshot; on double
+            failure keep the disk snapshots and escalate with recovery steps."""
+            try:
+                meta.replace(old_meta)
+            except Exception:
+                raise RuntimeError(
+                    "CRITICAL: rekey failed AND the old metadata could not be "
+                    "restored. The vault may be in a split-key state. "
+                    f"Pre-rekey recovery copies were kept at:\n    {db_snap}\n    {meta_snap}\n"
+                    "Restore them over vault.db and meta.json, then unlock with "
+                    "the OLD master password."
+                ) from cause
+            _discard_snapshots()
+
         try:
             for r in rows:
                 full = self._row_full_strict(r)
@@ -794,20 +866,43 @@ class DB:
                      new_crypto.enc_field(full["entry_uuid"], "notes", full["notes"]) if full["notes"] else "",
                      new_crypto.enc_field(full["entry_uuid"], "totp_secret", full["totp_secret"]) if full["totp_secret"] else "", new_ph, full["id"]),
                 )
+                # Old history hashes were HMAC'd under the OLD hash_key and can
+                # never match pw_hash() output under the new key, so they are
+                # dead weight — purge them. Do NOT insert the current hash into
+                # history: by design (see add()/update()) history stores only
+                # *retired* hashes, the live hash lives in entries.password_hash.
+                # The previous code inserted new_ph here, so the live password
+                # immediately "appeared in history" after every rekey.
                 self._db.execute("DELETE FROM password_history WHERE entry_id=?", (full["id"],))
-                self._db.execute("INSERT INTO password_history (entry_id,password_hash,changed_at) VALUES (?,?,?)", (full["id"], new_ph, utc_now()))
             self._log("REKEY", None)
             verify = new_crypto.enc(SENTINEL, aad_for_meta("verify"))
-            # FIX 1: commit the database first, then update the meta file.
-            # The original code wrote the meta before committing, meaning a
-            # failed commit would leave the meta pointing to the new key while
-            # the database still held data encrypted under the old key —
-            # silently corrupting the vault beyond recovery.
-            self._db.commit()
-            meta.update_master(new_salt, verify)
         except Exception:
+            # Nothing outside the open transaction was touched yet.
             self._db.rollback()
+            _discard_snapshots()
             raise
+
+        # 3. new metadata first…
+        try:
+            meta.update_master(new_salt, verify)
+        except Exception as meta_ex:
+            self._db.rollback()
+            # update_master normally self-restores, but replace() is atomic
+            # and idempotent — force the old snapshot back and verify.
+            _restore_old_meta_or_die(meta_ex)
+            raise
+
+        # 4. …then the commit, with a meta-restore compensator.
+        try:
+            self._db.commit()
+        except Exception as commit_ex:
+            try:
+                self._db.rollback()
+            except Exception:
+                pass
+            _restore_old_meta_or_die(commit_ex)
+            raise
+        _discard_snapshots()
 
     def health(self) -> Dict:
         result = {"db_readable": False, "decryptable": True, "entries": 0, "weak": 0, "expired": 0, "reused_hashes": 0}
@@ -998,8 +1093,18 @@ class VaultTerm:
                             self.meta.update_master(b64d(md["salt"]), self.crypto.enc(SENTINEL, aad_for_meta("verify")))
                     except Exception:
                         pass
-                    self.db = DB(DB_PATH, self.crypto)
-                    self.db.open()
+                    # FIX 10: the password is verified at this point, so a
+                    # failure opening/migrating the database must NOT fall
+                    # through to the generic handler below — previously it was
+                    # reported as "wrong password" and consumed login attempts
+                    # until the app terminated, even though the user typed the
+                    # correct master password every time.
+                    try:
+                        self.db = DB(DB_PATH, self.crypto)
+                        self.db.open()
+                    except Exception as db_ex:
+                        err(f"master password verified, but the database could not be opened: {escape(str(db_ex))}")
+                        sys.exit(3)
                     ok("access granted.")
                     time.sleep(0.25)
                     self.touch()
@@ -1433,37 +1538,73 @@ class VaultTerm:
     def _totp_live(self, totp_obj, name: str):
         """
         Cross-platform live TOTP display.
-        A background thread watches stdin for Enter; the main thread renders
-        the code + countdown bar every 0.5 s using raw ANSI escapes so that
-        Rich's buffering never gets in the way of the \\r overwrite.
+
+        The line is redrawn in place with `\\r`. Two rendering bugs are fixed
+        here:
+          * When the "next: XXXXXX" label disappeared at the start of a new
+            window, the line got ~14 chars shorter but only 3 trailing spaces
+            were printed, leaving residue on screen. Every redraw now ends
+            with ESC[K (erase to end of line).
+          * On narrow terminals the labelled line could exceed the terminal
+            width and wrap; `\\r` then returned to the start of the *wrapped*
+            row and redraws sliced the label (e.g. "next" rendered as "ext").
+            The countdown bar is now sized so the longest possible line fits
+            the current terminal width.
+
+        Input handling no longer uses a background thread blocked in
+        sys.stdin.readline(): if the user exited with Ctrl+C, that thread
+        stayed alive and silently consumed the next line typed at the main
+        menu. Instead, stdin is polled non-blockingly each tick (select on
+        POSIX, msvcrt on Windows).
         """
         interval = totp_obj.interval   # 30 s for standard TOTP
 
-        # ── background stdin watcher (cross-platform: no select.select) ──────
-        _stop = threading.Event()
-        def _stdin_watcher():
-            try:
-                sys.stdin.readline()
-            except Exception:
-                pass
-            _stop.set()
-        threading.Thread(target=_stdin_watcher, daemon=True).start()
+        # ── non-blocking "was Enter pressed?" poll ────────────────────────────
+        if os.name == "nt":
+            import msvcrt
+
+            def _enter_pressed() -> bool:
+                hit = False
+                while msvcrt.kbhit():
+                    ch = msvcrt.getwch()
+                    if ch in ("\r", "\n"):
+                        hit = True
+                return hit
+        else:
+            import select
+
+            def _enter_pressed() -> bool:
+                try:
+                    ready, _, _ = select.select([sys.stdin], [], [], 0)
+                except Exception:
+                    return False
+                if ready:
+                    # A full line is buffered (canonical mode) or EOF was hit;
+                    # consume it and exit either way to avoid a busy loop.
+                    sys.stdin.readline()
+                    return True
+                return False
 
         # ── ANSI codes (work on Linux, macOS, and modern Windows terminals) ──
         _CYAN  = "\033[96m";  _BOLD  = "\033[1m"
         _GREEN = "\033[92m";  _YELLOW= "\033[93m"
         _RED   = "\033[91m";  _DIM   = "\033[2m"
-        _RESET = "\033[0m"
+        _RESET = "\033[0m";   _EL    = "\033[K"   # erase to end of line
 
         console.print(
             f"\n  [{C_DIM}]live TOTP for[/{C_DIM}] [{C_HEAD}]{escape(str(name))}[/{C_HEAD}]"
             f"  [{C_DIM}]-- press ENTER to exit[/{C_DIM}]\n"
         )
 
-        BAR_WIDTH = 30
+        # Longest visible payload besides the bar:
+        #   "  " + code(6) + "  " + "[bar]" + "  " + "30s" + "  next: 123456"
+        # Reserve that fixed part and give the bar whatever fits, clamped.
+        term_w = console.width or 80
+        fixed = 2 + 6 + 2 + 2 + 2 + 3 + len("  next: 123456") + 1
+        BAR_WIDTH = max(10, min(30, term_w - fixed - 2))
         last_code = None
         try:
-            while not _stop.is_set():
+            while True:
                 ts        = int(time.time())
                 remaining = interval - (ts % interval)
                 code      = totp_obj.now()
@@ -1486,31 +1627,32 @@ class VaultTerm:
                     bar_col    = _GREEN
                     next_label = ""
 
-                # Flash the code text whenever it changes
                 code_style = _BOLD + (_RED if remaining <= 5 else _CYAN)
 
                 line = (
                     f"\r  {code_style}{code}{_RESET}"
                     f"  {bar_col}{bar}{_RESET}"
                     f"  {_DIM}{remaining:2d}s{_RESET}"
-                    f"{next_label}   "
+                    f"{next_label}{_EL}"
                 )
                 sys.stdout.write(line)
                 sys.stdout.flush()
 
                 last_code = code
-                _stop.wait(timeout=0.5)
+                time.sleep(0.5)
+                if _enter_pressed():
+                    break
 
         except KeyboardInterrupt:
-            _stop.set()
+            pass
 
         sys.stdout.write("\n")
         sys.stdout.flush()
         console.print()
 
-        # Offer clipboard copy of the last displayed code. Do not call pause() here:
-        # the Enter key used to exit the live view was already consumed by the
-        # stdin watcher, so another pause would force an unnecessary second Enter.
+        # Offer clipboard copy of the last displayed code. Do not call pause()
+        # here: the Enter used to exit was already consumed by _enter_pressed(),
+        # and a Ctrl+C exit leaves nothing pending on stdin.
         if last_code and self._clipboard_allowed() and _CLIP:
             if Confirm.ask(f"  copy [{last_code}] to clipboard?", default=False):
                 pyperclip.copy(last_code)
@@ -1646,19 +1788,27 @@ class VaultTerm:
         new_clip   = Prompt.ask(f"  [{C_HEAD}]clipboard_enabled[/{C_HEAD}]", default=cur_clip, choices=["0", "1"], show_choices=False)
 
         errors = []
+        def _int_or(v: str, default: int) -> int:
+            try:
+                return int(v)
+            except (TypeError, ValueError):
+                return default
         try:
             ed = int(new_expiry)
             if ed < 1: raise ValueError
         except ValueError:
             errors.append("expiry_days must be a positive integer.")
-            ed = int(cur_expiry)
+            # fall back to the current stored value, itself guarded against
+            # corruption — int(cur_expiry) here used to crash the menu if the
+            # settings table held a non-numeric value.
+            ed = _int_or(cur_expiry, EXPIRY_DAYS)
 
         try:
             lm = int(new_lock)
             if lm < 0: raise ValueError
         except ValueError:
             errors.append("auto_lock_minutes must be 0 or a positive integer.")
-            lm = int(cur_lock)
+            lm = _int_or(cur_lock, 10)
 
         for e in errors:
             err(e)
