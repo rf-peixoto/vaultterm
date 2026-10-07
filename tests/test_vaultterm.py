@@ -1,7 +1,9 @@
-"""VaultTerm v4 test suite (stdlib unittest; never touches ~/.vaultterm).
+"""VaultTerm v5 test suite (stdlib unittest; never touches ~/.vaultterm).
 
 Run:  .venv/bin/python -m unittest discover -s tests -v
 """
+import base64
+import itertools
 import json
 import os
 import shutil
@@ -25,7 +27,7 @@ class Base(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="vt-test-")
         self._oldP = vt.P
-        vt.P = vt.Paths(Path(self.tmp) / "vault")
+        vt.P = vt.Paths(Path(self.tmp) / "vault", Path(self.tmp) / "state")
         self.v = vt.Vault.create(MASTER, DEADMAN, FAST)
 
     def tearDown(self):
@@ -36,9 +38,9 @@ class Base(unittest.TestCase):
         vt.P = self._oldP
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def reopen(self, pw=MASTER):
+    def reopen(self, pw=MASTER, kf=None):
         self.v.close()
-        self.v = vt.Vault.unlock(pw)
+        self.v = vt.Vault.unlock(pw, kf)
         return self.v
 
     def raw(self):
@@ -48,12 +50,50 @@ class Base(unittest.TestCase):
         vt.P.vault.write_bytes(data)
 
 
+class Primitives(unittest.TestCase):
+    def test_key_commitment(self):
+        k1, k2 = os.urandom(32), os.urandom(32)
+        blob = vt.aead_seal(k1, b"secret", b"aad")
+        self.assertEqual(vt.aead_open(k1, blob, b"aad"), b"secret")
+        for key, aad in ((k2, b"aad"), (k1, b"other")):
+            with self.assertRaises(vt.InvalidTag):
+                vt.aead_open(key, blob, aad)
+        forged = bytearray(blob)
+        forged[20] ^= 1          # inside the commitment tag
+        with self.assertRaises(vt.InvalidTag):
+            vt.aead_open(k1, bytes(forged), b"aad")
+
+    def test_blake2b_everywhere(self):
+        self.assertEqual(vt.b2file_hex(b"abc"), "ba80a53f981c4d0d6a2797b69f12f6e94c212f14685ac4b74b12bb6fdbffa2d1"
+                                                "7d87c5392aab792dc252d5de4533cc9518d38aa8dbf1925ab92386edd4009923")
+        self.assertNotEqual(vt.b2(b"x", b"a"), vt.b2(b"x", b"b"))      # personalisation separates domains
+        self.assertNotEqual(vt.b2(b"x", key=b"k1"), vt.b2(b"x", key=b"k2"))
+
+    def test_hybrid_kem_events(self):
+        tmp = tempfile.mkdtemp()
+        old = vt.P
+        vt.P = vt.Paths(Path(tmp) / "v", Path(tmp) / "s")
+        try:
+            priv, pub = vt.new_event_keys()
+            vt.seal_event(pub, {"type": "UNLOCK_FAIL", "ts": "t1"})
+            vt.seal_event(pub, {"type": "ERROR", "detail": "secret detail"})
+            raw = vt.P.events.read_bytes()
+            self.assertNotIn(b"secret detail", raw)
+            self.assertGreater(len(raw.splitlines()[0]), (32 + vt.MLKEM_CT_LEN) * 4 // 3)   # ML-KEM ciphertext present
+            events, bad = vt.unseal_events(priv)
+            self.assertEqual(([e["type"] for e in events], bad), (["UNLOCK_FAIL", "ERROR"], 0))
+            other, _ = vt.new_event_keys()
+            self.assertEqual(vt.unseal_events(other), ([], 2))
+        finally:
+            vt.P = old
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 class FormatAndIntegrity(Base):
     def test_roundtrip_and_no_plaintext_on_disk(self):
         self.v.add_entry("password", "bank-name", "https://bank.example", "alice", "S3cret-Value-XYZ", "note-text", "")
         self.reopen()
-        e = self.v.entries()[0]
-        self.assertEqual(e["password"], "S3cret-Value-XYZ")
+        self.assertEqual(self.v.entries()[0]["password"], "S3cret-Value-XYZ")
         blob = self.raw()
         for needle in (b"bank-name", b"alice", b"S3cret", b"note-text", b"bank.example", b"expiry", b"history"):
             self.assertNotIn(needle, blob)
@@ -61,10 +101,8 @@ class FormatAndIntegrity(Base):
     def test_padding_hides_entry_count_and_lengths(self):
         size0 = len(self.raw())
         self.v.add_entry("password", "a", "", "", "x" * 12, "", "")
-        size1 = len(self.raw())
         for i in range(20):
             self.v.add_entry("password", f"name{i}", "https://example.com/" + "p" * i, "user", "y" * (12 + i), "n" * i, "")
-        self.assertEqual(size0, size1)
         self.assertEqual(size0, len(self.raw()))
 
     def test_payload_bitflip_is_integrity_error(self):
@@ -77,12 +115,12 @@ class FormatAndIntegrity(Base):
 
     def test_header_tamper_is_detected(self):
         hdr, hb, ct = vt.split_vault(self.raw())
-        hdr["core"]["kdf"]["time_cost"] += 1          # still within limits
+        hdr["core"]["kdf"]["time_cost"] += 1
         hb2 = vt.canon(hdr)
         self.write_raw(vt.MAGIC + struct.pack(">I", len(hb2)) + hb2 + ct)
         with self.assertRaises(vt.VaultError) as cm:
             self.reopen()
-        self.assertEqual(cm.exception.kind, "AUTH_FAILED")   # wrap AAD covers the core
+        self.assertEqual(cm.exception.kind, "AUTH_FAILED")
 
     def test_kdf_downgrade_rejected_before_derivation(self):
         hdr, hb, ct = vt.split_vault(self.raw())
@@ -94,7 +132,7 @@ class FormatAndIntegrity(Base):
         self.assertEqual(cm.exception.kind, "KDF_PARAMS")
 
     def test_garbage_and_truncation_are_format_errors(self):
-        for bad in (b"", b"hello world", self.raw()[:20], b"VTVAULT\x04" + b"\xff" * 40):
+        for bad in (b"", b"hello world", self.raw()[:20], vt.MAGIC + b"\xff" * 80, b"VTVAULT\x04" + self.raw()[8:]):
             self.write_raw(bad)
             with self.assertRaises(vt.VaultError) as cm:
                 vt.Vault.unlock(MASTER)
@@ -113,16 +151,121 @@ class FormatAndIntegrity(Base):
         self.assertNotIn(b"clipboard", self.raw())
         self.assertTrue(self.reopen().settings["clipboard_enabled"])
 
-    def test_rollback_of_single_entry_impossible(self):
-        # the old per-row attack: there are no rows any more. replacing the
-        # whole file with an older copy is visible through the generation.
+
+class Rollback(Base):
+    def test_older_copy_is_detected(self):
         self.v.add_entry("password", "bank", "", "", "OLD-compromised-1", "", "")
         old = self.raw()
-        e = self.v.entries()[0]
-        self.v.update_entry(e["id"], {"password": "NEW-rotated-pw-2"})
-        new_gen = self.v.data["generation"]
+        self.v.update_entry(self.v.entries()[0]["id"], {"password": "NEW-rotated-pw-2"})
+        self.assertEqual(self.v.rollback_status()[0], "ok")
         self.write_raw(old)
-        self.assertLess(self.reopen().data["generation"], new_gen)
+        status, body = self.reopen().evaluate_rollback()
+        self.assertEqual(status, "rollback")
+        self.assertGreater(body["generation"], self.v.data["generation"])
+        # working on the old copy (even past the recorded generation) must keep the evidence
+        for _ in range(6):
+            self.v.log_and_save("TEST")
+        self.assertEqual(self.v.rollback_status()[0], "rollback")
+        self.assertEqual(self.reopen().evaluate_rollback()[0], "rollback")      # survives a restart
+        self.v.accept_older_copy()
+        self.assertEqual(self.v.rollback_status()[0], "ok")
+        self.assertEqual(self.reopen().evaluate_rollback()[0], "ok")
+
+    def test_same_generation_different_content_is_rollback(self):
+        old = self.raw()
+        self.v.log_and_save("A")
+        self.write_raw(old)
+        v = self.reopen()
+        self.assertEqual(v.evaluate_rollback()[0], "rollback")
+
+    def test_interrupted_state_write_is_only_ahead(self):
+        with mock.patch.object(vt, "write_state"):
+            self.v.log_and_save("A")          # vault written, state not updated (simulated crash)
+        self.assertEqual(self.reopen().evaluate_rollback()[0], "ahead")
+        self.v.log_and_save("B")
+        self.assertEqual(self.v.rollback_status()[0], "ok")
+
+    def test_accepting_continues_the_counter(self):
+        old = self.raw()
+        self.v.log_and_save("A")
+        self.v.log_and_save("B")
+        newest = self.v.data["generation"]
+        self.write_raw(old)
+        v = self.reopen()
+        self.assertEqual(v.evaluate_rollback()[0], "rollback")
+        v.accept_older_copy()
+        self.assertEqual(v.rollback_status()[0], "ok")
+        self.assertGreater(v.data["generation"], newest)
+
+    def test_state_file_tamper_detected(self):
+        f = vt.P.state_file(self.v.vault_id)
+        doc = json.loads(f.read_text())
+        doc["generation"] = 999999
+        f.write_text(json.dumps(doc))
+        self.assertEqual(self.v.rollback_status()[0], "tampered")
+
+    def test_restore_keeps_generation_monotonic(self):
+        path, info = vt.create_backup(self.v)
+        info.wipe()
+        for i in range(5):
+            self.v.log_and_save("X")
+        newest = self.v.data["generation"]
+        info = vt.verify_backup(path, password=MASTER)
+        self.v.close()
+        self.v = vt.install_backup(info)
+        self.assertGreater(self.v.data["generation"], newest)
+        self.assertEqual(self.v.rollback_status()[0], "ok")
+
+
+class Keyfile(Base):
+    def setUp(self):
+        super().setUp()
+        self.kf_path = str(Path(self.tmp) / "usb.key")
+        self.kf = vt.create_keyfile(self.kf_path)
+
+    def test_keyfile_required_and_checked(self):
+        self.v.add_entry("password", "a", "", "", "first-password-1", "", "")
+        self.v.rekey(MASTER, FAST, self.kf).wipe()
+        self.v.close()
+        with self.assertRaises(vt.VaultError) as cm:
+            vt.Vault.unlock(MASTER)
+        self.assertEqual(cm.exception.kind, "KEYFILE")
+        other = Path(self.tmp) / "other.key"
+        other.write_bytes(os.urandom(64))
+        with self.assertRaises(vt.VaultError) as cm:
+            vt.Vault.unlock(MASTER, vt.read_keyfile(str(other)))
+        self.assertEqual(cm.exception.kind, "AUTH_FAILED")
+        self.v = vt.Vault.unlock(MASTER, vt.read_keyfile(self.kf_path))
+        self.assertEqual(self.v.entries()[0]["password"], "first-password-1")
+        self.assertTrue(self.v.verify_master(MASTER))
+
+    def test_deadman_works_without_keyfile(self):
+        self.v.rekey(MASTER, FAST, self.kf).wipe()
+        self.v.close()
+        with self.assertRaises(vt.DeadmanTriggered):
+            vt.Vault.unlock(DEADMAN)
+        with self.assertRaises(vt.DeadmanTriggered):
+            vt.Vault.unlock(DEADMAN, self.kf)
+
+    def test_remove_keyfile_and_convert_backups(self):
+        path, info = vt.create_backup(self.v)
+        info.wipe()
+        old = self.v.rekey(MASTER, FAST, self.kf)
+        self.assertEqual(vt.convert_backups(old, self.v)[0], [path])
+        old.wipe()
+        with self.assertRaises(vt.VaultError):
+            vt.verify_backup(path, password=MASTER)                    # now needs the keyfile
+        vt.verify_backup(path, password=MASTER, keyfile=self.kf).wipe()
+        self.v.rekey(MASTER, FAST, None).wipe()
+        self.reopen(MASTER)
+
+    def test_tiny_or_missing_keyfile_rejected(self):
+        small = Path(self.tmp) / "small"
+        small.write_bytes(b"x" * 10)
+        for p in (str(small), str(Path(self.tmp) / "nope")):
+            with self.assertRaises(vt.VaultError) as cm:
+                vt.read_keyfile(p)
+            self.assertEqual(cm.exception.kind, "KEYFILE")
 
 
 class EntriesAndHistory(Base):
@@ -131,8 +274,8 @@ class EntriesAndHistory(Base):
         b = self.v.add_entry("password", "b", "", "", "Same-Password-123", "", "")
         self.v.update_entry(a, {"password": "other-1-xxxxxxxx"})
         self.v.update_entry(b, {"password": "other-2-xxxxxxxx"})
-        ha, hb = self.v.get(a)["history"][0], self.v.get(b)["history"][0]
-        self.assertNotEqual(ha, hb)
+        self.assertNotEqual(self.v.get(a)["history"][0], self.v.get(b)["history"][0])
+        self.assertEqual(len(self.v.get(a)["history"][0]), 128)               # BLAKE2b-512 hex
         self.assertTrue(self.v.used_before(self.v.get(a), "Same-Password-123"))
         self.assertFalse(self.v.used_before(self.v.get(a), "never-used-value"))
 
@@ -151,8 +294,13 @@ class EntriesAndHistory(Base):
         self.v.update_entry(a, {"password": "rotated-password-9"})
         self.assertFalse(self.v.is_expired(self.v.get(a)))
 
-    def test_clear_optional_fields(self):
-        a = self.v.add_entry("password", "a", "u", "l", "first-password-1", "notes", "JBSWY3DPEHPK3PXP")
+    def test_totp_algorithm_per_entry(self):
+        a = self.v.add_entry("password", "a", "u", "l", "first-password-1", "notes", "JBSWY3DPEHPK3PXP", None, "SHA512")
+        self.assertEqual(self.reopen().get(a)["totp_algo"], "SHA512")
+        self.v.update_entry(a, {"totp_algo": "SHA1"})
+        self.assertEqual(self.v.get(a)["totp_algo"], "SHA1")
+        with self.assertRaises(vt.VaultError):
+            self.v.update_entry(a, {"totp_algo": "BLAKE2B"})
         self.v.update_entry(a, {"url": "", "notes": "", "totp": ""})
         e = self.v.get(a)
         self.assertEqual((e["url"], e["notes"], e["totp"]), ("", "", ""))
@@ -170,9 +318,10 @@ class Attachments(Base):
         data = os.urandom(5000)
         eid = self.v.add_entry("secret_key", "ssh", "", "", "", "", "", ("id_ed25519", data))
         self.assertEqual(self.reopen().attachment_bytes(self.v.get(eid)), data)
-        bid = self.v.get(eid)["attachment"]["blob"]
-        f = vt.blob_file(bid)
-        self.assertEqual(f.stat().st_size, 8192 + 28)     # padded bucket
+        att = self.v.get(eid)["attachment"]
+        self.assertEqual(att["b2"], vt.hashlib.blake2b(data).hexdigest())     # same as `b2sum`
+        f = vt.blob_file(att["blob"])
+        self.assertEqual(f.stat().st_size, 8192 + vt.AEAD_OVERHEAD)
         raw = bytearray(f.read_bytes())
         raw[100] ^= 1
         f.write_bytes(bytes(raw))
@@ -222,7 +371,7 @@ class Rekey(Base):
             with self.assertRaises(KeyboardInterrupt):
                 self.v.rekey("brand new master 1", FAST)
         self.assertEqual(before, self.raw())
-        self.assertEqual(len(list(vt.P.blobs.iterdir())), 3)     # new blobs cleaned up
+        self.assertEqual(len(list(vt.P.blobs.iterdir())), 3)
         v = self.reopen(MASTER)
         for e in v.entries():
             v.attachment_bytes(e)
@@ -253,7 +402,7 @@ class Backups(Base):
         old.wipe()
         self.assertEqual((conv, stale), ([path], []))
         with self.assertRaises(vt.VaultError):
-            vt.verify_backup(path, password=MASTER)          # old password no longer opens it
+            vt.verify_backup(path, password=MASTER)
         info = vt.verify_backup(path, password="brand new master 1")
         self.v.delete_entry(eid)
         self.v.close()
@@ -300,11 +449,13 @@ class Backups(Base):
 
 
 class Recovery(Base):
-    def test_kit_opens_vault_and_survives_rekey(self):
+    def test_kit_opens_vault_and_survives_rekey_and_keyfile(self):
         self.v.add_entry("password", "a", "", "", "first-password-1", "", "")
         kit, shares = self.v.create_recovery(2, 3)
         texts = [vt.encode_share(kit, 2, x, y) for x, y in shares]
-        self.v.rekey("brand new master 1", FAST).wipe()
+        self.assertTrue(texts[0].startswith("VT5-"))
+        kf = vt.create_keyfile(str(Path(self.tmp) / "k"))
+        self.v.rekey("brand new master 1", FAST, kf).wipe()
         picked = {}
         for t in (texts[0], texts[2]):
             kid, k, x, y = vt.decode_share(t.lower().replace("-", " "))
@@ -329,7 +480,7 @@ class Recovery(Base):
             vt.decode_share(bad)
 
     def test_pdf(self):
-        pdf = vt.build_recovery_pdf("0a1b2c3d", 2, 3, [(1, "VT4-ABCD-EFGH"), (2, "VT4-IJKL")], "2026-01-01")
+        pdf = vt.build_recovery_pdf("0a1b2c3d", 2, 3, [(1, "VT5-ABCD-EFGH"), (2, "VT5-IJKL")], "2026-01-01")
         self.assertTrue(pdf.startswith(b"%PDF-1.4") and pdf.rstrip().endswith(b"%%EOF"))
         self.assertIn(b"/Count 2", pdf)
 
@@ -353,10 +504,9 @@ class LogAndEvents(Base):
         self.assertTrue(self.v.verify_log()[0])
 
     def test_sealed_events_only_readable_after_unlock(self):
-        pub = vt.peek_event_pubkey()
-        vt.seal_event(pub, {"type": "UNLOCK_FAIL", "ts": "2026-01-01T00:00:00+00:00"})
+        vt.seal_event(vt.peek_core()["event_pub"], {"type": "UNLOCK_FAIL", "ts": "2026-01-01T00:00:00+00:00"})
         self.assertNotIn(b"UNLOCK_FAIL", vt.P.events.read_bytes())
-        events, bad = vt.unseal_events(self.v.data["event_privkey"])
+        events, bad = vt.unseal_events(self.v.data["event_keys"])
         self.assertEqual((events[0]["type"], bad), ("UNLOCK_FAIL", 0))
 
 
@@ -365,12 +515,12 @@ class PasswordsAndTotp(unittest.TestCase):
         for weak in ("Password123!Password", "Summer2024!Summer2024!", "qwertyuiop123", "aaaaaaaaaaaaaaaa1A!"):
             self.assertLess(vt.estimate_bits(weak), 40, weak)
         self.assertGreater(vt.estimate_bits(vt.gen_password(24)[0]), 120)
-        self.assertGreater(vt.estimate_bits(vt.gen_passphrase(6)[0]), 70)
+        self.assertGreater(vt.estimate_bits(vt.gen_passphrase(vt.PHRASE_DEFAULT)[0]), vt.MASTER_TARGET_BITS)
 
     def test_generators(self):
-        pw, bits = vt.gen_passphrase(6)
-        self.assertEqual(len(pw.split("-")), 6)
-        self.assertAlmostEqual(bits, 6 * 12.925, places=2)
+        pw, bits = vt.gen_passphrase(7)
+        self.assertEqual(len(pw.split("-")), 7)
+        self.assertAlmostEqual(bits, 7 * 12.925, places=2)
         pin, _ = vt.gen_pin(6)
         self.assertTrue(pin.isdigit() and len(pin) == 6)
         for prof in vt.GEN_PROFILES:
@@ -379,15 +529,25 @@ class PasswordsAndTotp(unittest.TestCase):
             for cls in vt.GEN_PROFILES[prof]:
                 self.assertTrue(any(c in cls for c in p))
 
-    def test_totp_rfc6238(self):
-        s = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"
-        for t, code in ((59, "94287082"), (1111111109, "07081804"), (1234567890, "89005924"), (2000000000, "69279037")):
-            self.assertEqual(vt.totp_code(s, at=t, digits=8), code)
+    def test_totp_rfc6238_all_algorithms(self):
+        keys = {"SHA1": b"12345678901234567890", "SHA256": b"12345678901234567890123456789012",
+                "SHA512": b"1234567890" * 6 + b"1234"}
+        vectors = {  # RFC 6238 appendix B
+            59: ("94287082", "46119246", "90693936"),
+            1111111109: ("07081804", "68084774", "25091201"),
+            1111111111: ("14050471", "67062674", "99943326"),
+            1234567890: ("89005924", "91819424", "93441116"),
+            2000000000: ("69279037", "90698825", "38618901"),
+            20000000000: ("65353130", "77737706", "47863826"),
+        }
+        for t, codes in vectors.items():
+            for algo, code in zip(("SHA1", "SHA256", "SHA512"), codes):
+                secret = base64.b32encode(keys[algo]).decode()
+                self.assertEqual(vt.totp_code(secret, at=t, algo=algo, digits=8), code, (t, algo))
         with self.assertRaises(vt.VaultError):
             vt.totp_code("not base32 !!")
 
     def test_shamir_all_subsets(self):
-        import itertools
         secret = os.urandom(32)
         shares = vt.shamir_split(secret, 3, 5)
         for combo in itertools.combinations(shares, 3):

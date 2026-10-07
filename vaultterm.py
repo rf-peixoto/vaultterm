@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 """
-VAULTTERM v4 -- offline terminal password vault for Linux.
+VAULTTERM v5 -- offline terminal password vault for Linux.
 
 Storage model (see README.md for the full design):
-  * one vault file: MAGIC | header (JSON, authenticated) | payload (ChaCha20-Poly1305)
-  * the payload is the whole vault (entries, settings, audit log, keys), padded
-    to 32 KiB buckets, encrypted with a random 256-bit data key (DEK)
-  * the DEK is wrapped by a key derived from the master password with Argon2id
+  * one vault file: MAGIC | header (JSON, authenticated) | payload
+  * the payload is the whole vault (entries, settings, audit log, inner keys),
+    padded to 32 KiB buckets, encrypted with ChaCha20-Poly1305 under a random
+    256-bit data key (DEK) plus a BLAKE2b key-commitment tag
+  * the DEK is wrapped by a key derived from the master password with
+    Argon2id (optionally mixed with a keyfile) and HKDF-BLAKE2b-512
   * optional paper recovery kit: a second wrap of the DEK under a random
-    recovery key that is split with Shamir's secret sharing and printed
+    recovery key split with Shamir's secret sharing and printed as a PDF
   * attachments ("secret keys") are separate encrypted, padded blob files whose
-    SHA-256 is recorded inside the authenticated payload
+    BLAKE2b-512 digest is recorded inside the authenticated payload
+  * pre-unlock events are sealed with hybrid X25519 + ML-KEM-1024
+  * every hash / MAC / KDF is BLAKE2b-based, except TOTP (dictated by RFC 6238)
 """
 
 from __future__ import annotations
@@ -51,6 +55,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import mlkem
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from cryptography.hazmat.primitives.kdf.argon2 import Argon2id
@@ -75,33 +80,42 @@ except Exception:  # pragma: no cover - optional dependency
 
 # ── constants ────────────────────────────────────────────────────────────────
 
-VERSION = "4.0.0"
-FORMAT_VERSION = 4
-MAGIC = b"VTVAULT\x04"
+VERSION = "5.0.0"
+FORMAT_VERSION = 5
+MAGIC = b"VTVAULT\x05"
 
 ARGON2_RECOMMENDED = {"time_cost": 3, "memory_cost": 262144, "parallelism": 4}   # 256 MiB
 ARGON2_MIN = {"time_cost": 2, "memory_cost": 65536, "parallelism": 1}            # 64 MiB
 ARGON2_MAX = {"time_cost": 64, "memory_cost": 4194304, "parallelism": 16}        # 4 GiB
 SALT_LEN = 32
 KEY_LEN = 32
-WRAP_LEN = 12 + KEY_LEN + 16
+COMMIT_LEN = 32
+AEAD_OVERHEAD = 12 + COMMIT_LEN + 16          # nonce | key commitment | Poly1305 tag
+WRAP_LEN = AEAD_OVERHEAD + KEY_LEN
+MLKEM_PUB_LEN = 1568
+MLKEM_CT_LEN = 1568
+MLKEM_SEED_LEN = 64
 
 PAYLOAD_BUCKET = 32 * 1024
 MAX_HEADER = 64 * 1024
 MAX_VAULT_FILE = 256 * 1024 * 1024
 MAX_ATTACHMENT = 64 * 1024 * 1024
 MAX_SHOW_TEXT = 64 * 1024
+KEYFILE_MIN, KEYFILE_MAX = 32, 64 * 1024 * 1024
 LOG_MAX_ITEMS = 2000
 HISTORY_MAX = 24
-EVENTS_MAX_BYTES = 256 * 1024
+EVENTS_MAX_BYTES = 1024 * 1024
 
 MASTER_MIN_LEN = 12
-MASTER_TARGET_BITS = 60
+MASTER_TARGET_BITS = 80        # Grover-margin target for the master/deadman passwords
+ENTRY_WEAK_BITS = 60
 ENTRY_WARN_LEN = 12
 
 KINDS = ("password", "pin", "passphrase", "secret_key")
 KIND_LABEL = {"password": "password", "pin": "PIN", "passphrase": "passphrase", "secret_key": "secret key"}
 KIND_SHORT = {"password": "pw", "pin": "pin", "passphrase": "phrase", "secret_key": "key"}
+TOTP_ALGOS = {"SHA1": hashlib.sha1, "SHA256": hashlib.sha256, "SHA512": hashlib.sha512}
+TOTP_LABEL = {"SHA1": "SHA-1", "SHA256": "SHA-256", "SHA512": "SHA-512"}
 
 DEFAULT_SETTINGS = {
     "expiry_days": 30,
@@ -110,9 +124,9 @@ DEFAULT_SETTINGS = {
     "clipboard_clear_seconds": 30,
 }
 
-DEADMAN_SENTINEL = b"VAULTTERM::DEADMAN::v4"
-RECOVERY_INFO = b"vaultterm/v4/recovery-kek"
-EVENT_INFO = b"vaultterm/v4/sealed-event"
+DEADMAN_SENTINEL = b"VAULTTERM::DEADMAN::v5"
+RECOVERY_INFO = b"vaultterm/v5/recovery-kek"
+EVENT_INFO = b"vaultterm/v5/sealed-event/x25519+mlkem1024"
 
 ERROR_TEXT = {
     "AUTH_FAILED": "authentication failed.",
@@ -121,6 +135,7 @@ ERROR_TEXT = {
                        "reinstall VaultTerm and initialise a new vault.",
     "VAULT_MISSING": "vault file not found, but other vault data exists.",
     "KDF_PARAMS": "key-derivation parameters are outside safe limits.",
+    "KEYFILE": "the keyfile could not be used.",
     "BLOB_INTEGRITY": "an encrypted attachment failed its integrity check.",
     "IO_ERROR": "a file operation failed.",
     "BACKUP_INVALID": "the backup could not be verified.",
@@ -145,18 +160,30 @@ C_LABEL = "cyan"
 console = Console(highlight=False)
 
 
+def _default_base() -> Path:
+    env = os.environ.get("VAULTTERM_DIR")
+    return Path(env).expanduser().absolute() if env else Path.home() / ".vaultterm"
+
+
+def _default_state_dir() -> Path:
+    env = os.environ.get("VAULTTERM_STATE_DIR")
+    if env:
+        return Path(env).expanduser().absolute()
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    return (Path(xdg) if xdg else Path.home() / ".config") / "vaultterm"
+
+
 class Paths:
-    def __init__(self, base: Path):
+    def __init__(self, base: Path, state_dir: Optional[Path] = None):
         self.base = base
         self.vault = base / "vault.vt"
         self.blobs = base / "blobs"
         self.backups = base / "backups"
         self.events = base / "events.sealed"
+        self.state_dir = state_dir or _default_state_dir()
 
-
-def _default_base() -> Path:
-    env = os.environ.get("VAULTTERM_DIR")
-    return Path(env).expanduser().absolute() if env else Path.home() / ".vaultterm"
+    def state_file(self, vault_id: str) -> Path:
+        return self.state_dir / f"{vault_id}.state"
 
 
 P = Paths(_default_base())
@@ -240,7 +267,7 @@ def printable(s: str, keep_newlines: bool = False) -> str:
     return "".join(out)
 
 
-def human_size(n: int) -> str:
+def human_size(n: float) -> str:
     for unit in ("B", "KiB", "MiB", "GiB"):
         if n < 1024 or unit == "GiB":
             return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
@@ -280,7 +307,7 @@ def header(title: str):
 def banner():
     console.print()
     w = min(console.width or 72, 100)
-    tag = f"  VAULTTERM v{VERSION}  //  ChaCha20-Poly1305  //  Argon2id  //  OFFLINE"
+    tag = f"  VAULTTERM v{VERSION}  //  ChaCha20-Poly1305 + BLAKE2b  //  Argon2id  //  ML-KEM  //  OFFLINE"
     console.print(f"[{C_HEAD}]{'=' * w}[/{C_HEAD}]")
     console.print(f"[{C_HEAD}]{tag}[/{C_HEAD}]")
     console.print(f"[{C_HEAD}]{'=' * w}[/{C_HEAD}]")
@@ -472,7 +499,17 @@ def shred_tree(root: Path):
     except OSError:
         pass
 
-# ── crypto primitives ────────────────────────────────────────────────────────
+# ── crypto primitives (BLAKE2b everywhere) ───────────────────────────────────
+
+
+def b2(data: bytes, person: bytes = b"", key=None, size: int = 64) -> bytes:
+    """BLAKE2b; keyed (a PRF/MAC) when `key` is given; `person` = domain separation."""
+    return hashlib.blake2b(bytes(data), digest_size=size, key=bytes(key) if key is not None else b"", person=person).digest()
+
+
+def b2file_hex(data: bytes) -> str:
+    """Plain BLAKE2b-512, identical to coreutils `b2sum`."""
+    return hashlib.blake2b(data).hexdigest()
 
 
 def wipe(buf: Optional[bytearray]):
@@ -480,19 +517,28 @@ def wipe(buf: Optional[bytearray]):
         ctypes.memset((ctypes.c_char * len(buf)).from_buffer(buf), 0, len(buf))
 
 
+def _key_commit(key, nonce: bytes, aad: bytes) -> bytes:
+    """Key-commitment tag: ChaCha20-Poly1305 alone is not key-committing (a
+    crafted ciphertext can decrypt under two keys). This binds key+nonce+AAD."""
+    return b2(nonce + b2(aad, b"vt5-aad", size=32), b"vt5-commit", key=key, size=COMMIT_LEN)
+
+
 def aead_seal(key, plaintext: bytes, aad: bytes) -> bytes:
     nonce = os.urandom(12)
-    return nonce + ChaCha20Poly1305(bytes(key)).encrypt(nonce, plaintext, aad)
+    return nonce + _key_commit(key, nonce, aad) + ChaCha20Poly1305(bytes(key)).encrypt(nonce, plaintext, aad)
 
 
 def aead_open(key, blob: bytes, aad: bytes) -> bytes:
-    if len(blob) < 28:
+    if len(blob) < AEAD_OVERHEAD:
         raise InvalidTag()
-    return ChaCha20Poly1305(bytes(key)).decrypt(blob[:12], blob[12:], aad)
+    nonce, commit, ct = blob[:12], blob[12:12 + COMMIT_LEN], blob[12 + COMMIT_LEN:]
+    if not hmac.compare_digest(commit, _key_commit(key, nonce, aad)):
+        raise InvalidTag()
+    return ChaCha20Poly1305(bytes(key)).decrypt(nonce, ct, aad)
 
 
 def hkdf(ikm, info: bytes, length: int = KEY_LEN) -> bytes:
-    return HKDF(algorithm=hashes.SHA256(), length=length, salt=None, info=info).derive(bytes(ikm))
+    return HKDF(algorithm=hashes.BLAKE2b(64), length=length, salt=None, info=info).derive(bytes(ikm))
 
 
 def check_kdf_params(p: Any) -> Dict[str, int]:
@@ -511,15 +557,57 @@ def kdf_weaker(p: Dict[str, int], ref: Dict[str, int] = ARGON2_RECOMMENDED) -> b
     return p["memory_cost"] < ref["memory_cost"] or p["time_cost"] < ref["time_cost"]
 
 
-def derive_kek(password: str, salt: bytes, params: Dict[str, int]) -> bytearray:
+def derive_kek(password: str, salt: bytes, params: Dict[str, int], keyfile=None) -> bytearray:
+    """Argon2id (which is itself built on BLAKE2b) -> 64 bytes, optionally mixed
+    with a keyfile digest, -> HKDF-BLAKE2b-512 -> 256-bit key-encryption key."""
     check_kdf_params(params)
     pw = unicodedata.normalize("NFC", password).encode("utf-8")
     try:
-        out = Argon2id(salt=salt, length=KEY_LEN, iterations=params["time_cost"],
+        raw = Argon2id(salt=salt, length=64, iterations=params["time_cost"],
                        lanes=params["parallelism"], memory_cost=params["memory_cost"]).derive(pw)
     except MemoryError:
         raise VaultError("KDF_PARAMS", "not enough memory for the configured Argon2id parameters")
-    return bytearray(out)
+    if keyfile is not None:
+        return bytearray(hkdf(raw + bytes(keyfile), b"vaultterm/v5/kek|keyfile"))
+    return bytearray(hkdf(raw, b"vaultterm/v5/kek"))
+
+
+def read_keyfile(path: str) -> bytearray:
+    """Any file (>= 32 bytes) can be a keyfile; only its BLAKE2b-512 digest is used."""
+    real = os.path.realpath(os.path.expanduser(path))
+    try:
+        fd = os.open(real, os.O_RDONLY | os.O_CLOEXEC)
+    except OSError as e:
+        raise VaultError("KEYFILE", f"{real}: {e.strerror}")
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise VaultError("KEYFILE", f"{real}: not a regular file")
+        if not (KEYFILE_MIN <= st.st_size <= KEYFILE_MAX):
+            raise VaultError("KEYFILE", f"{real}: size must be {KEYFILE_MIN} bytes .. 64 MiB")
+        h = hashlib.blake2b(digest_size=64, person=b"vt5-keyfile")
+        while True:
+            chunk = os.read(fd, 1 << 20)
+            if not chunk:
+                break
+            h.update(chunk)
+        return bytearray(h.digest())
+    finally:
+        os.close(fd)
+
+
+def create_keyfile(path: str) -> bytearray:
+    real = os.path.abspath(os.path.expanduser(path))
+    try:
+        fd = os.open(real, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o400)
+        try:
+            _write_all(fd, os.urandom(64))
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError as e:
+        raise VaultError("KEYFILE", f"{real}: {e.strerror}")
+    return read_keyfile(real)
 
 
 class DataKeys:
@@ -527,8 +615,8 @@ class DataKeys:
 
     def __init__(self, dek: bytes):
         self.dek = bytearray(dek)
-        self.payload = bytearray(hkdf(dek, b"vaultterm/v4/payload"))
-        self.blob = bytearray(hkdf(dek, b"vaultterm/v4/blob"))
+        self.payload = bytearray(hkdf(dek, b"vaultterm/v5/payload"))
+        self.blob = bytearray(hkdf(dek, b"vaultterm/v5/blob"))
 
     def wipe(self):
         for b in (self.dek, self.payload, self.blob):
@@ -536,7 +624,7 @@ class DataKeys:
 
 
 def aad_wrap(kind: str, core: Dict) -> bytes:
-    return b"vaultterm|v4|wrap|" + kind.encode() + b"|" + canon(core)
+    return b"vaultterm|v5|wrap|" + kind.encode() + b"|" + canon(core)
 
 
 def aad_payload(header_bytes: bytes) -> bytes:
@@ -544,11 +632,11 @@ def aad_payload(header_bytes: bytes) -> bytes:
 
 
 def aad_blob(bid: str) -> bytes:
-    return b"vaultterm|v4|blob|" + bid.encode("ascii")
+    return b"vaultterm|v5|blob|" + bid.encode("ascii")
 
 
 def aad_deadman(salt: bytes) -> bytes:
-    return b"vaultterm|v4|deadman|" + salt
+    return b"vaultterm|v5|deadman|" + salt
 
 
 def pad_bucket(pt: bytes, bucket: int) -> bytes:
@@ -590,6 +678,7 @@ def make_deadman(password: str, params: Dict[str, int]) -> Dict:
 
 
 def deadman_matches(password: str, dm: Dict) -> bool:
+    """The deadman never needs the keyfile: it must work under coercion."""
     salt = b64d(dm["salt"])
     k = derive_kek(password, salt, dm["kdf"])
     try:
@@ -599,7 +688,77 @@ def deadman_matches(password: str, dm: Dict) -> bool:
     finally:
         wipe(k)
 
+# ── hybrid post-quantum sealing (X25519 + ML-KEM-1024) ───────────────────────
+
+
+def new_event_keys() -> Tuple[Dict[str, str], Dict[str, str]]:
+    x = X25519PrivateKey.generate()
+    m = mlkem.MLKEM1024PrivateKey.generate()
+    priv = {"x25519": b64e(x.private_bytes_raw()), "mlkem1024": b64e(m.private_bytes_raw())}
+    pub = {"x25519": b64e(x.public_key().public_bytes_raw()), "mlkem1024": b64e(m.public_key().public_bytes_raw())}
+    return priv, pub
+
+
+def _hybrid_key(ss_m: bytes, ss_x: bytes, ct: bytes, eph: bytes, pub_x: bytes, pub_m: bytes) -> bytes:
+    # Secure as long as EITHER X25519 or ML-KEM-1024 is unbroken (X-Wing style
+    # combiner: both shared secrets + the transcript go into the KDF).
+    return hkdf(ss_m + ss_x + b2(ct + eph + pub_x + pub_m, b"vt5-kem-transcr"), EVENT_INFO)
+
+
+def seal_event(pub: Optional[Dict[str, str]], event: Dict):
+    if not pub:
+        return
+    try:
+        if os.path.lexists(P.events) and os.lstat(P.events).st_size > EVENTS_MAX_BYTES:
+            return
+        pub_x, pub_m = b64d(pub["x25519"]), b64d(pub["mlkem1024"])
+        eph = X25519PrivateKey.generate()
+        eph_pub = eph.public_key().public_bytes_raw()
+        ss_x = eph.exchange(X25519PublicKey.from_public_bytes(pub_x))
+        ss_m, ct = mlkem.MLKEM1024PublicKey.from_public_bytes(pub_m).encapsulate()
+        key = _hybrid_key(ss_m, ss_x, ct, eph_pub, pub_x, pub_m)
+        line = (b64e(eph_pub + ct + aead_seal(key, canon(event), b"vaultterm|v5|event")) + "\n").encode("ascii")
+        ensure_dir(P.base)
+        fd = os.open(P.events, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        try:
+            _write_all(fd, line)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except Exception:
+        pass
+
+
+def unseal_events(priv: Dict[str, str]) -> Tuple[List[Dict], int]:
+    if not os.path.lexists(P.events):
+        return [], 0
+    try:
+        raw = read_file_nofollow(P.events, EVENTS_MAX_BYTES * 2)
+    except VaultError:
+        return [], 1
+    px = X25519PrivateKey.from_private_bytes(b64d(priv["x25519"]))
+    pm = mlkem.MLKEM1024PrivateKey.from_seed_bytes(b64d(priv["mlkem1024"]))
+    pub_x = px.public_key().public_bytes_raw()
+    pub_m = pm.public_key().public_bytes_raw()
+    events, bad = [], 0
+    for line in raw.splitlines():
+        try:
+            blob = b64d(line.decode("ascii").strip())
+            eph, ct, body = blob[:32], blob[32:32 + MLKEM_CT_LEN], blob[32 + MLKEM_CT_LEN:]
+            ss_x = px.exchange(X25519PublicKey.from_public_bytes(eph))
+            ss_m = pm.decapsulate(ct)
+            ev = json.loads(aead_open(_hybrid_key(ss_m, ss_x, ct, eph, pub_x, pub_m), body, b"vaultterm|v5|event"))
+            if isinstance(ev, dict):
+                events.append(ev)
+            else:
+                bad += 1
+        except Exception:
+            bad += 1
+    return events, bad
+
 # ── vault file format ────────────────────────────────────────────────────────
+
+CORE_KEYS = {"format", "vault_id", "kdf", "salt", "keyfile", "deadman", "event_pub", "recovery_kit"}
 
 
 def validate_header(h: Any):
@@ -610,14 +769,18 @@ def validate_header(h: Any):
     try:
         need(isinstance(h, dict) and set(h) == {"core", "wraps"}, "top-level keys")
         core, wraps = h["core"], h["wraps"]
-        need(isinstance(core, dict) and set(core) == {"format", "kdf", "salt", "deadman", "event_pubkey", "recovery_kit"}, "core keys")
+        need(isinstance(core, dict) and set(core) == CORE_KEYS, "core keys")
         need(core["format"] == FORMAT_VERSION, f"format {core['format']!r}")
+        need(isinstance(core["vault_id"], str) and re.fullmatch(r"[0-9a-f]{32}", core["vault_id"]) is not None, "vault id")
         need(len(b64d(core["salt"])) == SALT_LEN, "salt length")
+        need(isinstance(core["keyfile"], bool), "keyfile flag")
         dm = core["deadman"]
         need(isinstance(dm, dict) and set(dm) == {"kdf", "salt", "verify"}, "deadman keys")
         need(len(b64d(dm["salt"])) == SALT_LEN, "deadman salt length")
-        need(len(b64d(dm["verify"])) == 12 + len(DEADMAN_SENTINEL) + 16, "deadman token length")
-        need(len(b64d(core["event_pubkey"])) == 32, "event key length")
+        need(len(b64d(dm["verify"])) == AEAD_OVERHEAD + len(DEADMAN_SENTINEL), "deadman token length")
+        ep = core["event_pub"]
+        need(isinstance(ep, dict) and set(ep) == {"x25519", "mlkem1024"}, "event key set")
+        need(len(b64d(ep["x25519"])) == 32 and len(b64d(ep["mlkem1024"])) == MLKEM_PUB_LEN, "event key length")
         rk = core["recovery_kit"]
         need(rk is None or (isinstance(rk, str) and re.fullmatch(r"[0-9a-f]{8}", rk) is not None), "recovery kit id")
         need(isinstance(wraps, dict) and set(wraps) == {"master", "recovery"}, "wrap keys")
@@ -636,9 +799,9 @@ def validate_header(h: Any):
 
 def split_vault(raw: bytes) -> Tuple[Dict, bytes, bytes]:
     if len(raw) < 12 or raw[:8] != MAGIC:
-        raise VaultError("VAULT_FORMAT", "bad magic (not a VaultTerm v4 vault)")
+        raise VaultError("VAULT_FORMAT", "bad magic (not a VaultTerm v5 vault)")
     hl = struct.unpack(">I", raw[8:12])[0]
-    if hl == 0 or hl > MAX_HEADER or 12 + hl + 28 > len(raw):
+    if hl == 0 or hl > MAX_HEADER or 12 + hl + AEAD_OVERHEAD > len(raw):
         raise VaultError("VAULT_FORMAT", f"bad header length {hl}")
     hb = raw[12:12 + hl]
     try:
@@ -671,25 +834,28 @@ def validate_payload(d: Any):
             d["settings"].setdefault(k, v)
             need(type(d["settings"][k]) is type(v), f"setting {k}")
         need(isinstance(d["entries"], list), "entries")
+        need(isinstance(d["blobs"], dict), "blobs")
         ids = set()
         for e in d["entries"]:
             need(isinstance(e, dict), "entry type")
             need(type(e["id"]) is int and e["id"] not in ids, "entry id")
             ids.add(e["id"])
             need(e["kind"] in KINDS, "entry kind")
+            need(e["totp_algo"] in TOTP_ALGOS, "totp algorithm")
             for k in ("uuid", "name", "url", "login", "password", "notes", "totp", "created_at", "rotated_at", "modified_at"):
                 need(isinstance(e[k], str), f"entry field {k}")
             need(isinstance(e["history"], list), "history")
             att = e["attachment"]
             need(att is None or (isinstance(att, dict) and att.get("blob") in d["blobs"]), "attachment reference")
-        need(isinstance(d["blobs"], dict), "blobs")
         for bid, meta in d["blobs"].items():
             need(re.fullmatch(r"[0-9a-f]{32}", bid) is not None, "blob id")
-            need(isinstance(meta, dict) and isinstance(meta.get("sha256"), str), "blob meta")
+            need(isinstance(meta, dict) and isinstance(meta.get("b2"), str), "blob meta")
         lg = d["log"]
         need(isinstance(lg, dict) and isinstance(lg["items"], list) and type(lg["next_seq"]) is int, "log")
-        need(len(b64d(d["keys"]["history"])) == KEY_LEN and len(b64d(d["keys"]["log"])) == KEY_LEN, "inner keys")
-        need(len(b64d(d["event_privkey"])) == 32, "event key")
+        for k in ("history", "log", "state"):
+            need(len(b64d(d["keys"][k])) == KEY_LEN, f"inner key {k}")
+        ek = d["event_keys"]
+        need(len(b64d(ek["x25519"])) == 32 and len(b64d(ek["mlkem1024"])) == MLKEM_SEED_LEN, "event keys")
         rec = d["recovery"]
         need(rec is None or (isinstance(rec, dict) and len(b64d(rec["rk"])) == KEY_LEN), "recovery")
     except VaultError:
@@ -731,61 +897,47 @@ def read_vault_file(path: Optional[Path] = None) -> bytes:
         raise VaultError("VAULT_FORMAT", e.detail)
 
 
-def peek_event_pubkey() -> Optional[str]:
+def peek_core() -> Optional[Dict]:
     try:
         hdr, _, _ = split_vault(read_vault_file())
-        return hdr["core"]["event_pubkey"]
+        return hdr["core"]
     except Exception:
         return None
 
-# ── sealed pre-unlock events (readable only after unlock) ────────────────────
+# ── rollback detection (local state outside the vault folder) ────────────────
 
 
-def seal_event(pub_b64: Optional[str], event: Dict):
-    if not pub_b64:
-        return
+def _state_mac(state_key: bytes, body: Dict) -> str:
+    return b2(canon(body), b"vt5-state", key=state_key).hex()
+
+
+def read_state(vault_id: str, state_key: bytes) -> Tuple[str, Optional[Dict]]:
+    """Returns (status, body): status in ok / missing / tampered."""
+    path = P.state_file(vault_id)
+    if not os.path.lexists(path):
+        return "missing", None
     try:
-        if os.path.lexists(P.events) and os.lstat(P.events).st_size > EVENTS_MAX_BYTES:
-            return
-        pub = b64d(pub_b64)
-        eph = X25519PrivateKey.generate()
-        eph_pub = eph.public_key().public_bytes_raw()
-        key = hkdf(eph.exchange(X25519PublicKey.from_public_bytes(pub)) + eph_pub + pub, EVENT_INFO)
-        line = (b64e(eph_pub + aead_seal(key, canon(event), b"vaultterm|v4|event")) + "\n").encode("ascii")
-        ensure_dir(P.base)
-        fd = os.open(P.events, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
-        try:
-            _write_all(fd, line)
-            os.fsync(fd)
-        finally:
-            os.close(fd)
+        doc = json.loads(read_file_nofollow(path, 64 * 1024))
+        body = {k: doc[k] for k in ("vault_id", "generation", "saved_at", "file_b2", "pending")}
+        if body["vault_id"] != vault_id or type(body["generation"]) is not int or type(body["pending"]) is not bool:
+            return "tampered", None
+        if not hmac.compare_digest(_state_mac(state_key, body), doc["mac"]):
+            return "tampered", None
+        return "ok", body
     except Exception:
-        pass
+        return "tampered", None
 
 
-def unseal_events(priv_b64: str) -> Tuple[List[Dict], int]:
-    if not os.path.lexists(P.events):
-        return [], 0
+def write_state(vault_id: str, state_key: bytes, generation: int, saved_at: str, file_b2: str, pending: bool = False):
+    """generation = highest ever seen here; file_b2 = BLAKE2b of the last vault
+    file legitimately written; pending = an older copy was seen and not accepted."""
     try:
-        raw = read_file_nofollow(P.events, EVENTS_MAX_BYTES * 2)
-    except VaultError:
-        return [], 1
-    priv = X25519PrivateKey.from_private_bytes(b64d(priv_b64))
-    pub = priv.public_key().public_bytes_raw()
-    events, bad = [], 0
-    for line in raw.splitlines():
-        try:
-            blob = b64d(line.decode("ascii").strip())
-            eph_pub = blob[:32]
-            key = hkdf(priv.exchange(X25519PublicKey.from_public_bytes(eph_pub)) + eph_pub + pub, EVENT_INFO)
-            ev = json.loads(aead_open(key, blob[32:], b"vaultterm|v4|event"))
-            if isinstance(ev, dict):
-                events.append(ev)
-            else:
-                bad += 1
-        except Exception:
-            bad += 1
-    return events, bad
+        ensure_dir(P.state_dir)
+        body = {"vault_id": vault_id, "generation": generation, "saved_at": saved_at,
+                "file_b2": file_b2, "pending": pending}
+        atomic_write(P.state_file(vault_id), canon(dict(body, mac=_state_mac(state_key, body))))
+    except Exception:
+        pass  # best effort: never block a save because ~/.config is unwritable
 
 # ── attachments ("secret key" files) ─────────────────────────────────────────
 
@@ -799,7 +951,7 @@ def write_blob(keys: DataKeys, plain: bytes) -> Tuple[str, Dict]:
     bid = secrets.token_hex(16)
     ct = aead_seal(keys.blob, blob_pad(plain), aad_blob(bid))
     atomic_write(blob_file(bid), ct)
-    return bid, {"sha256": hashlib.sha256(ct).hexdigest(), "size": len(plain)}
+    return bid, {"b2": b2file_hex(ct), "size": len(plain)}
 
 
 def read_blob(keys: DataKeys, bid: str, meta: Dict, raw: Optional[bytes] = None) -> bytes:
@@ -808,8 +960,8 @@ def read_blob(keys: DataKeys, bid: str, meta: Dict, raw: Optional[bytes] = None)
             raw = read_file_nofollow(blob_file(bid), MAX_ATTACHMENT * 2 + (1 << 20))
         except VaultError as e:
             raise VaultError("BLOB_INTEGRITY", f"blob {bid}: {e.detail}")
-    if not hmac.compare_digest(hashlib.sha256(raw).hexdigest(), meta["sha256"]):
-        raise VaultError("BLOB_INTEGRITY", f"blob {bid}: SHA-256 mismatch")
+    if not hmac.compare_digest(b2file_hex(raw), meta["b2"]):
+        raise VaultError("BLOB_INTEGRITY", f"blob {bid}: BLAKE2b mismatch")
     try:
         return unpad(aead_open(keys.blob, raw, aad_blob(bid)))
     except (InvalidTag, ValueError, struct.error):
@@ -819,64 +971,83 @@ def read_blob(keys: DataKeys, bid: str, meta: Dict, raw: Optional[bytes] = None)
 
 
 class Vault:
-    def __init__(self, hdr: Dict, keys: DataKeys, kek: Optional[bytearray], data: Dict):
+    def __init__(self, hdr: Dict, keys: DataKeys, kek: Optional[bytearray], data: Dict,
+                 keyfile: Optional[bytearray] = None):
         self.header = hdr
         self.keys = keys
-        self.kek = kek          # None when opened through the paper recovery kit
+        self.kek = kek            # None when opened through the paper recovery kit
+        self.keyfile = keyfile    # BLAKE2b digest of the keyfile, kept for re-wraps
         self.data = data
+        self.accept_rollback = False
+        self.loaded_hash: Optional[str] = None      # BLAKE2b of the vault file we opened / last wrote
+        self.rollback_flag = False
+        self.rollback_body: Optional[Dict] = None
+
+    @property
+    def vault_id(self) -> str:
+        return self.header["core"]["vault_id"]
 
     # ---- lifecycle -----------------------------------------------------------
 
     @classmethod
-    def create(cls, master: str, deadman: str, params: Optional[Dict] = None) -> "Vault":
+    def create(cls, master: str, deadman: str, params: Optional[Dict] = None, keyfile=None) -> "Vault":
         params = dict(params or ARGON2_RECOMMENDED)
         salt = os.urandom(SALT_LEN)
-        kek = derive_kek(master, salt, params)
+        kek = derive_kek(master, salt, params, keyfile)
         keys = DataKeys(os.urandom(KEY_LEN))
-        evk = X25519PrivateKey.generate()
+        ev_priv, ev_pub = new_event_keys()
         core = {
-            "format": FORMAT_VERSION, "kdf": params, "salt": b64e(salt),
-            "deadman": make_deadman(deadman, params),
-            "event_pubkey": b64e(evk.public_key().public_bytes_raw()),
-            "recovery_kit": None,
+            "format": FORMAT_VERSION, "vault_id": secrets.token_hex(16), "kdf": params, "salt": b64e(salt),
+            "keyfile": keyfile is not None, "deadman": make_deadman(deadman, params),
+            "event_pub": ev_pub, "recovery_kit": None,
         }
         now = utc_now()
         data = {
             "format": FORMAT_VERSION, "generation": 0, "created_at": now, "saved_at": now,
             "settings": dict(DEFAULT_SETTINGS), "next_id": 1, "entries": [], "blobs": {},
-            "log": {"anchor": "0" * 64, "next_seq": 1, "items": []},
-            "keys": {"history": b64e(os.urandom(KEY_LEN)), "log": b64e(os.urandom(KEY_LEN))},
-            "event_privkey": b64e(evk.private_bytes_raw()),
+            "log": {"anchor": "0" * 128, "next_seq": 1, "items": []},
+            "keys": {k: b64e(os.urandom(KEY_LEN)) for k in ("history", "log", "state")},
+            "event_keys": ev_priv,
             "recovery": None,
         }
-        v = cls(build_header(core, kek, keys.dek, data), keys, kek, data)
+        v = cls(build_header(core, kek, keys.dek, data), keys, kek, data,
+                bytearray(keyfile) if keyfile is not None else None)
         ensure_dir(P.base)
         with v.transaction():
-            v.log("INIT", detail=f"argon2id t={params['time_cost']} m={params['memory_cost']}KiB p={params['parallelism']}")
+            v.log("INIT", detail=f"argon2id t={params['time_cost']} m={params['memory_cost']}KiB p={params['parallelism']}"
+                                 f"{' + keyfile' if keyfile is not None else ''}")
         return v
 
     @classmethod
-    def unlock(cls, password: str) -> "Vault":
-        hdr, hb, ct = split_vault(read_vault_file())
+    def unlock(cls, password: str, keyfile=None) -> "Vault":
+        raw = read_vault_file()
+        hdr, hb, ct = split_vault(raw)
         core = hdr["core"]
-        kek = derive_kek(password, b64d(core["salt"]), core["kdf"])
+        if core["keyfile"] and keyfile is None:
+            if deadman_matches(password, core["deadman"]):
+                raise DeadmanTriggered()
+            raise VaultError("KEYFILE", "this vault requires its keyfile")
+        kek = derive_kek(password, b64d(core["salt"]), core["kdf"], keyfile if core["keyfile"] else None)
         try:
             dek = aead_open(kek, b64d(hdr["wraps"]["master"]), aad_wrap("master", core))
         except InvalidTag:
             wipe(kek)
             if deadman_matches(password, core["deadman"]):
                 raise DeadmanTriggered()
-            raise VaultError("AUTH_FAILED", "master key unwrap failed (wrong password or modified header)")
+            raise VaultError("AUTH_FAILED", "master key unwrap failed (wrong password/keyfile or modified header)")
         try:
             keys, data = open_payload(hdr, hb, ct, dek)
         except VaultError:
             wipe(kek)
             raise
-        return cls(hdr, keys, kek, data)
+        v = cls(hdr, keys, kek, data, bytearray(keyfile) if (keyfile is not None and core["keyfile"]) else None)
+        v.loaded_hash = b2file_hex(raw)
+        return v
 
     @classmethod
     def unlock_with_recovery(cls, rk: bytes) -> "Vault":
-        hdr, hb, ct = split_vault(read_vault_file())
+        raw = read_vault_file()
+        hdr, hb, ct = split_vault(raw)
         if not hdr["core"]["recovery_kit"]:
             raise VaultError("RECOVERY_INVALID", "this vault has no active recovery kit")
         try:
@@ -884,18 +1055,24 @@ class Vault:
         except InvalidTag:
             raise VaultError("RECOVERY_INVALID", "the combined shares do not unwrap the data key")
         keys, data = open_payload(hdr, hb, ct, dek)
-        return cls(hdr, keys, None, data)
+        v = cls(hdr, keys, None, data)
+        v.loaded_hash = b2file_hex(raw)
+        return v
 
     def close(self):
         if self.keys:
             self.keys.wipe()
         wipe(self.kek)
+        wipe(self.keyfile)
         self.kek = None
+        self.keyfile = None
         self.data = {}
 
     def verify_master(self, password: str) -> bool:
         core = self.header["core"]
-        k = derive_kek(password, b64d(core["salt"]), core["kdf"])
+        if core["keyfile"] and self.keyfile is None:
+            return False
+        k = derive_kek(password, b64d(core["salt"]), core["kdf"], self.keyfile if core["keyfile"] else None)
         try:
             dek = aead_open(k, b64d(self.header["wraps"]["master"]), aad_wrap("master", core))
             return hmac.compare_digest(dek, bytes(self.keys.dek))
@@ -911,9 +1088,58 @@ class Vault:
         data = dict(self.data)
         data["generation"] = self.data["generation"] + 1
         data["saved_at"] = utc_now()
-        atomic_write(P.vault, pack_vault(self.header, self.keys, data))
+        blob = pack_vault(self.header, self.keys, data)
+        atomic_write(P.vault, blob)
         self.data["generation"] = data["generation"]
         self.data["saved_at"] = data["saved_at"]
+        self.loaded_hash = b2file_hex(blob)
+        self.record_state()
+
+    def record_state(self):
+        """Keep the machine-local rollback record in step with the vault. While
+        an older copy is in use and not accepted, the record keeps the evidence
+        (pending=True) and the high-water generation instead of being moved."""
+        key = b64d(self.data["keys"]["state"])
+        if self.rollback_flag and not self.accept_rollback:
+            status, body = read_state(self.vault_id, key)
+            if status == "ok":
+                write_state(self.vault_id, key, max(body["generation"], self.data["generation"]),
+                            body["saved_at"], body["file_b2"], pending=True)
+            return
+        write_state(self.vault_id, key, self.data["generation"], self.data["saved_at"], self.loaded_hash or "")
+
+    def rollback_status(self) -> Tuple[str, Optional[Dict]]:
+        """ok | missing | tampered | rollback (older copy) | ahead (newer than the
+        record: an interrupted save or an edit made on another machine)."""
+        if self.rollback_flag:
+            return "rollback", self.rollback_body
+        status, body = read_state(self.vault_id, b64d(self.data["keys"]["state"]))
+        if status != "ok":
+            return status, body
+        if body["pending"]:
+            return "rollback", body
+        if hmac.compare_digest(body["file_b2"], self.loaded_hash or ""):
+            return "ok", body
+        if body["generation"] >= self.data["generation"]:
+            return "rollback", body
+        return "ahead", body
+
+    def evaluate_rollback(self) -> Tuple[str, Optional[Dict]]:
+        status, body = self.rollback_status()
+        if status == "rollback":
+            self.rollback_flag, self.rollback_body = True, body
+        return status, body
+
+    def accept_older_copy(self):
+        body = self.rollback_body or {}
+        self.accept_rollback = True
+        try:
+            with self.transaction():
+                self.data["generation"] = max(self.data["generation"], body.get("generation", 0))
+                self.log("ROLLBACK_ACCEPTED", detail="user confirmed the older vault copy")
+        finally:
+            self.accept_rollback = False
+        self.rollback_flag, self.rollback_body = False, None
 
     @contextmanager
     def transaction(self):
@@ -934,6 +1160,9 @@ class Vault:
 
     # ---- tamper-evident audit log ---------------------------------------------
 
+    def _log_mac(self, body: Dict) -> str:
+        return b2(canon(body), b"vt5-log", key=b64d(self.data["keys"]["log"])).hex()
+
     def log(self, action: str, entry_id: Optional[int] = None, detail: str = "",
             ref: Optional[str] = None, ts: Optional[str] = None):
         """Append to the hash-chained log. Call inside a transaction()."""
@@ -944,7 +1173,7 @@ class Vault:
             "detail": str(detail)[:2000], "ref": ref,
             "prev": items[-1]["mac"] if items else lg["anchor"],
         }
-        item["mac"] = hmac.new(b64d(self.data["keys"]["log"]), canon(item), hashlib.sha256).hexdigest()
+        item["mac"] = self._log_mac(item)
         items.append(item)
         lg["next_seq"] += 1
         if len(items) > LOG_MAX_ITEMS:
@@ -958,7 +1187,6 @@ class Vault:
 
     def verify_log(self) -> Tuple[bool, int, Optional[int]]:
         lg = self.data["log"]
-        key = b64d(self.data["keys"]["log"])
         prev = lg["anchor"]
         items = lg["items"]
         for i, it in enumerate(items):
@@ -966,7 +1194,7 @@ class Vault:
             good = (
                 it.get("prev") == prev
                 and isinstance(it.get("mac"), str)
-                and hmac.compare_digest(hmac.new(key, canon(body), hashlib.sha256).hexdigest(), it["mac"])
+                and hmac.compare_digest(self._log_mac(body), it["mac"])
                 and (i == 0 or it["seq"] == items[i - 1]["seq"] + 1)
             )
             if not good:
@@ -992,9 +1220,9 @@ class Vault:
         return age_days(e["rotated_at"]) >= self.settings["expiry_days"]
 
     def fingerprint(self, entry_uuid: str, password: str) -> str:
-        """Per-entry keyed hash of a retired password (history only)."""
+        """Per-entry keyed BLAKE2b of a retired password (history only)."""
         msg = entry_uuid.encode() + b"\x00" + unicodedata.normalize("NFC", password).encode("utf-8")
-        return hmac.new(b64d(self.data["keys"]["history"]), msg, hashlib.sha256).hexdigest()
+        return b2(msg, b"vt5-history", key=b64d(self.data["keys"]["history"])).hex()
 
     def used_before(self, e: Dict, password: str) -> bool:
         if e["password"] and hmac.compare_digest(e["password"].encode(), password.encode()):
@@ -1029,7 +1257,9 @@ class Vault:
         return hits
 
     def add_entry(self, kind: str, name: str, url: str, login: str, password: str, notes: str,
-                  totp: str, file: Optional[Tuple[str, bytes]] = None) -> int:
+                  totp: str, file: Optional[Tuple[str, bytes]] = None, totp_algo: str = "SHA1") -> int:
+        if totp_algo not in TOTP_ALGOS:
+            raise VaultError("INPUT", f"unknown TOTP algorithm {totp_algo}")
         bid = None
         if file:
             bid, bmeta = write_blob(self.keys, file[1])
@@ -1041,12 +1271,11 @@ class Vault:
                 att = None
                 if bid:
                     self.data["blobs"][bid] = bmeta
-                    att = {"blob": bid, "filename": file[0], "size": len(file[1]),
-                           "sha256": hashlib.sha256(file[1]).hexdigest()}
+                    att = {"blob": bid, "filename": file[0], "size": len(file[1]), "b2": b2file_hex(file[1])}
                 self.data["entries"].append({
                     "id": eid, "uuid": str(uuid.uuid4()), "kind": kind, "name": name, "url": url,
-                    "login": login, "password": password, "notes": notes, "totp": totp, "history": [],
-                    "created_at": now, "rotated_at": now, "modified_at": now, "attachment": att,
+                    "login": login, "password": password, "notes": notes, "totp": totp, "totp_algo": totp_algo,
+                    "history": [], "created_at": now, "rotated_at": now, "modified_at": now, "attachment": att,
                 })
                 self.log("ADD", eid, KIND_LABEL[kind])
         except BaseException:
@@ -1059,7 +1288,10 @@ class Vault:
         e = self.get(eid)
         if not e:
             raise VaultError("INPUT", f"entry {eid} does not exist")
-        fields = [k for k in ("name", "url", "login", "notes", "totp", "password") if k in changes and changes[k] != e[k]]
+        if "totp_algo" in changes and changes["totp_algo"] not in TOTP_ALGOS:
+            raise VaultError("INPUT", "unknown TOTP algorithm")
+        fields = [k for k in ("name", "url", "login", "notes", "totp", "totp_algo", "password")
+                  if k in changes and changes[k] != e[k]]
         if not fields and not file:
             return False
         bid = old_bid = None
@@ -1081,8 +1313,7 @@ class Vault:
                         old_bid = e["attachment"]["blob"]
                         self.data["blobs"].pop(old_bid, None)
                     self.data["blobs"][bid] = bmeta
-                    e["attachment"] = {"blob": bid, "filename": file[0], "size": len(file[1]),
-                                       "sha256": hashlib.sha256(file[1]).hexdigest()}
+                    e["attachment"] = {"blob": bid, "filename": file[0], "size": len(file[1]), "b2": b2file_hex(file[1])}
                     e["rotated_at"] = now
                     fields.append("file")
                 e["modified_at"] = now
@@ -1112,14 +1343,14 @@ class Vault:
     def attachment_bytes(self, e: Dict) -> bytes:
         att = e["attachment"]
         plain = read_blob(self.keys, att["blob"], self.data["blobs"][att["blob"]])
-        if not hmac.compare_digest(hashlib.sha256(plain).hexdigest(), att["sha256"]):
-            raise VaultError("BLOB_INTEGRITY", f"entry {e['id']}: plaintext hash mismatch")
+        if not hmac.compare_digest(b2file_hex(plain), att["b2"]):
+            raise VaultError("BLOB_INTEGRITY", f"entry {e['id']}: plaintext BLAKE2b mismatch")
         return plain
 
     # ---- key management ------------------------------------------------------------
 
-    def rekey(self, new_password: str, params: Optional[Dict] = None) -> DataKeys:
-        """Rotate the data key AND the master password/KDF parameters.
+    def rekey(self, new_password: str, params: Optional[Dict] = None, keyfile=None) -> DataKeys:
+        """Rotate the data key AND the master password / keyfile / KDF parameters.
 
         Every attachment is re-encrypted to a new blob file first; the single
         atomic rename of the vault file is the commit point. Interrupting at
@@ -1144,16 +1375,20 @@ class Vault:
                 if e["attachment"]:
                     e["attachment"]["blob"] = mapping[e["attachment"]["blob"]][0]
             new_salt = os.urandom(SALT_LEN)
-            new_kek = derive_kek(new_password, new_salt, params)
-            core = dict(self.header["core"], kdf=params, salt=b64e(new_salt))
-            nv = Vault(build_header(core, new_kek, new_keys.dek, data), new_keys, new_kek, data)
+            new_kek = derive_kek(new_password, new_salt, params, keyfile)
+            core = dict(self.header["core"], kdf=params, salt=b64e(new_salt), keyfile=keyfile is not None)
+            nv = Vault(build_header(core, new_kek, new_keys.dek, data), new_keys, new_kek, data,
+                       bytearray(keyfile) if keyfile is not None else None)
+            nv.loaded_hash, nv.rollback_flag, nv.rollback_body = self.loaded_hash, self.rollback_flag, self.rollback_body
             nv.log("REKEY", detail=f"data key rotated; argon2id t={params['time_cost']} "
                                    f"m={params['memory_cost']}KiB p={params['parallelism']}; "
+                                   f"keyfile={'yes' if keyfile is not None else 'no'}; "
                                    f"{len(mapping)} attachment(s) re-encrypted")
-            old_keys, old_kek, old_blobs = self.keys, self.kek, list(self.data["blobs"])
+            old_keys, old_kek, old_kf, old_blobs = self.keys, self.kek, self.keyfile, list(self.data["blobs"])
             with signals_blocked():
                 nv._commit()
-                self.header, self.keys, self.kek, self.data = nv.header, nv.keys, nv.kek, nv.data
+                self.header, self.keys, self.kek, self.keyfile, self.data = nv.header, nv.keys, nv.kek, nv.keyfile, nv.data
+                self.loaded_hash = nv.loaded_hash
         except BaseException:
             if self.keys is not new_keys:
                 for nb in created:
@@ -1162,55 +1397,48 @@ class Vault:
                 wipe(new_kek)
             raise
         wipe(old_kek)
+        wipe(old_kf)
         for b in old_blobs:
             shred_file(blob_file(b))
         return old_keys
 
-    def change_deadman(self, new_deadman: str):
+    def _rewrap_core(self, core: Dict, action: str, detail: str = "", data_change=None):
         if self.kek is None:
             raise VaultError("INPUT", "set a new master password first")
-        core = dict(self.header["core"], deadman=make_deadman(new_deadman, ARGON2_RECOMMENDED))
         old = self.header
-        self.header = build_header(core, self.kek, self.keys.dek, self.data)
         try:
             with self.transaction():
-                self.log("DEADMAN_CHANGED")
+                if data_change:
+                    data_change()
+                self.header = build_header(core, self.kek, self.keys.dek, self.data)
+                self.log(action, detail=detail)
         except BaseException:
             self.header = old
             raise
 
+    def change_deadman(self, new_deadman: str):
+        core = dict(self.header["core"], deadman=make_deadman(new_deadman, ARGON2_RECOMMENDED))
+        self._rewrap_core(core, "DEADMAN_CHANGED")
+
     def create_recovery(self, threshold: int, shares: int) -> Tuple[str, List[Tuple[int, bytes]]]:
-        if self.kek is None:
-            raise VaultError("INPUT", "set a new master password first")
         rk = os.urandom(KEY_LEN)
         kit_id = secrets.token_hex(4)
-        old = self.header
-        try:
-            with self.transaction():
-                self.data["recovery"] = {"kit_id": kit_id, "rk": b64e(rk), "threshold": threshold,
-                                         "shares": shares, "created_at": utc_now()}
-                core = dict(self.header["core"], recovery_kit=kit_id)
-                self.header = build_header(core, self.kek, self.keys.dek, self.data)
-                self.log("RECOVERY_KIT", detail=f"new kit {kit_id}: any {threshold} of {shares} shares")
-        except BaseException:
-            self.header = old
-            raise
+
+        def change():
+            self.data["recovery"] = {"kit_id": kit_id, "rk": b64e(rk), "threshold": threshold,
+                                     "shares": shares, "created_at": utc_now()}
+
+        self._rewrap_core(dict(self.header["core"], recovery_kit=kit_id), "RECOVERY_KIT",
+                          f"new kit {kit_id}: any {threshold} of {shares} shares", change)
         return kit_id, shamir_split(rk, threshold, shares)
 
     def revoke_recovery(self):
-        if self.kek is None:
-            raise VaultError("INPUT", "set a new master password first")
-        old = self.header
-        try:
-            with self.transaction():
-                kit = (self.data["recovery"] or {}).get("kit_id")
-                self.data["recovery"] = None
-                core = dict(self.header["core"], recovery_kit=None)
-                self.header = build_header(core, self.kek, self.keys.dek, self.data)
-                self.log("RECOVERY_REVOKED", detail=f"kit {kit}")
-        except BaseException:
-            self.header = old
-            raise
+        kit = (self.data["recovery"] or {}).get("kit_id")
+
+        def change():
+            self.data["recovery"] = None
+
+        self._rewrap_core(dict(self.header["core"], recovery_kit=None), "RECOVERY_REVOKED", f"kit {kit}", change)
 
 # ── backups ──────────────────────────────────────────────────────────────────
 
@@ -1219,12 +1447,14 @@ _BLOB_MEMBER = re.compile(r"^blobs/([0-9a-f]{32})\.blob$")
 
 
 class BackupInfo:
-    def __init__(self, path, raw, blobs, hdr, keys, data, kek):
-        self.path, self.raw, self.blobs, self.header, self.keys, self.data, self.kek = path, raw, blobs, hdr, keys, data, kek
+    def __init__(self, path, raw, blobs, hdr, keys, data, kek, keyfile):
+        self.path, self.raw, self.blobs, self.header = path, raw, blobs, hdr
+        self.keys, self.data, self.kek, self.keyfile = keys, data, kek, keyfile
 
     def wipe(self):
         self.keys.wipe()
         wipe(self.kek)
+        wipe(self.keyfile)
 
 
 def list_backups() -> List[Path]:
@@ -1240,8 +1470,8 @@ def _tar_add_bytes(tar: tarfile.TarFile, name: str, data: bytes):
     tar.addfile(ti, io.BytesIO(data))
 
 
-def _write_backup_file(final: Path, vault_raw: bytes, blob_ids: List[str], blob_source: Dict[str, bytes]):
-    """Write tar to <final>.partial, fsync, rename. blob_source overrides disk."""
+def _write_backup_file(final: Path, vault_raw: bytes, blob_ids: List[str], blob_source: Dict[str, bytes]) -> Path:
+    """Write tar to <final>.partial, fsync; caller renames. blob_source overrides disk."""
     ensure_dir(P.backups)
     tmp = final.with_name(final.name + ".partial")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
@@ -1296,7 +1526,17 @@ def read_backup(path: Path) -> Tuple[bytes, Dict[str, bytes]]:
     return vault_raw, blobs
 
 
-def verify_backup(path: Path, dek=None, kek=None, password: Optional[str] = None) -> BackupInfo:
+def backup_core(path: Path) -> Optional[Dict]:
+    try:
+        with open(path, "rb") as fh, tarfile.open(fileobj=fh, mode="r:") as tar:
+            head = tar.extractfile(tar.getmember("vault.vt")).read(12 + MAX_HEADER)
+        hl = struct.unpack(">I", head[8:12])[0]
+        return json.loads(head[12:12 + hl].decode("ascii"))["core"]
+    except Exception:
+        return None
+
+
+def verify_backup(path: Path, dek=None, kek=None, password: Optional[str] = None, keyfile=None) -> BackupInfo:
     """Fully verify: header, master-key unwrap, payload authentication, and
     every referenced attachment (hash + decryption)."""
     raw, blobs = read_backup(path)
@@ -1307,7 +1547,9 @@ def verify_backup(path: Path, dek=None, kek=None, password: Optional[str] = None
     core = hdr["core"]
     use_kek = None
     if password is not None:
-        use_kek = derive_kek(password, b64d(core["salt"]), core["kdf"])
+        if core["keyfile"] and keyfile is None:
+            raise VaultError("KEYFILE", f"{path.name}: this backup requires a keyfile")
+        use_kek = derive_kek(password, b64d(core["salt"]), core["kdf"], keyfile if core["keyfile"] else None)
     elif kek is not None:
         use_kek = bytearray(kek)
     unwrapped = None
@@ -1315,11 +1557,10 @@ def verify_backup(path: Path, dek=None, kek=None, password: Optional[str] = None
         try:
             unwrapped = aead_open(use_kek, b64d(hdr["wraps"]["master"]), aad_wrap("master", core))
         except InvalidTag:
-            if password is not None:
-                wipe(use_kek)
-                raise VaultError("AUTH_FAILED", f"{path.name}: wrong password for this backup")
             wipe(use_kek)
             use_kek = None
+            if password is not None:
+                raise VaultError("AUTH_FAILED", f"{path.name}: wrong password/keyfile for this backup")
     candidate = unwrapped if unwrapped is not None else (bytes(dek) if dek is not None else None)
     if candidate is None:
         raise VaultError("BACKUP_INVALID", f"{path.name}: no key available (older password?)")
@@ -1337,20 +1578,16 @@ def verify_backup(path: Path, dek=None, kek=None, password: Optional[str] = None
         keys.wipe()
         wipe(use_kek)
         raise VaultError("BACKUP_INVALID", f"{path.name}: {e.detail}")
-    return BackupInfo(path, raw, blobs, hdr, keys, data, use_kek)
+    kf = bytearray(keyfile) if (keyfile is not None and core["keyfile"] and unwrapped is not None) else None
+    return BackupInfo(path, raw, blobs, hdr, keys, data, use_kek, kf)
 
 
 def backup_uses_current_password(path: Path, vault: Vault) -> Optional[bool]:
-    try:
-        with open(path, "rb") as fh, tarfile.open(fileobj=fh, mode="r:") as tar:
-            m = tar.getmember("vault.vt")
-            head = tar.extractfile(m).read(12 + MAX_HEADER)
-        hl = struct.unpack(">I", head[8:12])[0]
-        hdr = json.loads(head[12:12 + hl].decode("ascii"))
-        core = vault.header["core"]
-        return hdr["core"]["salt"] == core["salt"] and hdr["core"]["kdf"] == core["kdf"]
-    except Exception:
+    core = backup_core(path)
+    if core is None:
         return None
+    cur = vault.header["core"]
+    return core.get("salt") == cur["salt"] and core.get("kdf") == cur["kdf"] and core.get("keyfile") == cur["keyfile"]
 
 
 def create_backup(vault: Vault, label: str = "manual") -> Tuple[Path, BackupInfo]:
@@ -1390,8 +1627,9 @@ def preserve_unverified_state(label: str) -> Optional[Path]:
 
 def convert_backups(old_keys: DataKeys, vault: Vault) -> Tuple[List[Path], List[Path]]:
     """After a rekey: re-wrap every backup that was made under the previous
-    data key so it opens with the NEW master password. Returns (converted, stale)."""
+    data key so it opens with the NEW master password/keyfile. Returns (converted, stale)."""
     converted, stale = [], []
+    vcore = vault.header["core"]
     for path in list_backups():
         try:
             raw, blobs = read_backup(path)
@@ -1401,16 +1639,15 @@ def convert_backups(old_keys: DataKeys, vault: Vault) -> Tuple[List[Path], List[
             stale.append(path)
             continue
         try:
-            core = dict(hdr["core"], kdf=vault.header["core"]["kdf"], salt=vault.header["core"]["salt"])
+            core = dict(hdr["core"], kdf=vcore["kdf"], salt=vcore["salt"], keyfile=vcore["keyfile"])
             if core["recovery_kit"] and not data.get("recovery"):
                 core["recovery_kit"] = None
-            new_hdr = build_header(core, vault.kek, keys.dek, data)
-            new_raw = pack_vault(new_hdr, keys, data)
+            new_raw = pack_vault(build_header(core, vault.kek, keys.dek, data), keys, data)
             tmp = _write_backup_file(path.with_name(path.name + ".converting-dst"), new_raw, list(blobs), blobs)
             conv = path.with_name(path.name + ".converting")
             os.replace(tmp, conv)
             with signals_blocked():
-                shred_file(path)          # best-effort overwrite of the old-password copy
+                shred_file(path)          # best-effort overwrite of the old-credential copy
                 os.replace(conv, path)
             fsync_dir(P.backups)
             converted.append(path)
@@ -1422,13 +1659,14 @@ def convert_backups(old_keys: DataKeys, vault: Vault) -> Tuple[List[Path], List[
 
 
 def install_backup(info: BackupInfo) -> Vault:
-    """Write a verified backup's blobs and vault file into place."""
+    """Write a verified backup's blobs and vault file into place. The restored
+    vault continues the generation counter so rollback detection stays monotonic."""
     ensure_dir(P.blobs)
     for bid, meta in info.data["blobs"].items():
         target = blob_file(bid)
         if os.path.lexists(target):
             try:
-                same = hashlib.sha256(read_file_nofollow(target)).hexdigest() == meta["sha256"]
+                same = b2file_hex(read_file_nofollow(target)) == meta["b2"]
             except VaultError:
                 same = False
             if same:
@@ -1437,11 +1675,16 @@ def install_backup(info: BackupInfo) -> Vault:
         atomic_write(target, info.blobs[bid])
     with signals_blocked():
         atomic_write(P.vault, info.raw)
-    kek = info.kek
-    info.kek = None
-    v = Vault(info.header, info.keys, kek, info.data)
+    kek, kf = info.kek, info.keyfile
+    info.kek = info.keyfile = None
+    v = Vault(info.header, info.keys, kek, info.data, kf)
+    v.loaded_hash = b2file_hex(info.raw)
+    status, body = read_state(v.vault_id, b64d(v.data["keys"]["state"]))
+    original = v.data["generation"]
+    if status == "ok" and body["generation"] > original:
+        v.data["generation"] = body["generation"]
     with v.transaction():
-        v.log("RESTORED", detail=f"from {info.path.name}")
+        v.log("RESTORED", detail=f"from {info.path.name} (backup generation {original})")
     return v
 
 # ── housekeeping ─────────────────────────────────────────────────────────────
@@ -1473,7 +1716,7 @@ def housekeeping(vault: Vault) -> List[Tuple[str, str]]:
         notes.append(("CLEANUP", f"shredded interrupted write {f.name}"))
     if P.backups.is_dir():
         for f in P.backups.iterdir():
-            if f.name.endswith(".partial") or f.name.endswith(".converting-dst") or f.name.endswith(".tmp"):
+            if f.name.endswith((".partial", ".converting-dst", ".tmp")):
                 shred_file(f)
                 notes.append(("CLEANUP", f"shredded incomplete backup {f.name}"))
             elif f.name.endswith(".converting"):
@@ -1503,8 +1746,7 @@ def _gf_init():
     for i in range(255):
         _GF_EXP[i] = x
         _GF_LOG[x] = i
-        # multiply by generator 3 in GF(2^8) with the AES polynomial 0x11b
-        y = x << 1
+        y = x << 1            # multiply by the generator 3 (AES polynomial 0x11b)
         if y & 0x100:
             y ^= 0x11B
         x = y ^ x
@@ -1560,16 +1802,19 @@ def shamir_combine(shares: Dict[int, bytes]) -> bytes:
     return bytes(res)
 
 
+def _share_check(body: bytes) -> bytes:
+    return b2(body, b"vt5-share", size=4)
+
+
 def encode_share(kit_id: str, k: int, x: int, y: bytes) -> str:
     body = bytes.fromhex(kit_id) + bytes([k, x]) + y
-    chk = hashlib.sha256(b"vaultterm-share-v4" + body).digest()[:4]
-    s = base64.b32encode(body + chk).decode("ascii").rstrip("=")
-    return "VT4-" + "-".join(s[i:i + 4] for i in range(0, len(s), 4))
+    s = base64.b32encode(body + _share_check(body)).decode("ascii").rstrip("=")
+    return "VT5-" + "-".join(s[i:i + 4] for i in range(0, len(s), 4))
 
 
 def decode_share(text: str) -> Tuple[str, int, int, bytes]:
     s = re.sub(r"[\s\-]", "", text.upper())
-    if s.startswith("VT4"):
+    if s.startswith("VT5"):
         s = s[3:]
     try:
         raw = base64.b32decode(s + "=" * (-len(s) % 8))
@@ -1578,7 +1823,7 @@ def decode_share(text: str) -> Tuple[str, int, int, bytes]:
     if len(raw) != 4 + 2 + KEY_LEN + 4:
         raise VaultError("RECOVERY_INVALID", f"share has wrong length ({len(raw)} bytes)")
     body, chk = raw[:-4], raw[-4:]
-    if not hmac.compare_digest(hashlib.sha256(b"vaultterm-share-v4" + body).digest()[:4], chk):
+    if not hmac.compare_digest(_share_check(body), chk):
         raise VaultError("RECOVERY_INVALID", "share checksum mismatch (typo?)")
     k, x = body[4], body[5]
     if not (1 <= k <= 16 and 1 <= x <= 16):
@@ -1618,9 +1863,8 @@ def build_recovery_pdf(kit_id: str, k: int, n: int, shares: List[Tuple[int, str]
         t(50, 748, 10, f"Kit ID: {kit_id}      Created: {created}")
         ops.append("0.6 w 50 735 m 545 735 l S")
         groups = text.split("-")
-        lines = ["-".join(groups[i:i + 4]) for i in range(0, len(groups), 4)]
         y = 700
-        for ln in lines:
+        for ln in ["-".join(groups[i:i + 4]) for i in range(0, len(groups), 4)]:
             t(50, y, 14, ln, "F3")
             y -= 24
         matrix = _qr_matrix(text)
@@ -1638,22 +1882,23 @@ def build_recovery_pdf(kit_id: str, k: int, n: int, shares: List[Tuple[int, str]
             "HOW TO USE",
             f"Run   vaultterm --recover   (or ./start.sh --recover) and type at least {k} different",
             "shares from this kit. Dashes and spaces are optional; letters are A-Z and digits 2-7.",
-            "You will then be asked to set a new master password.",
+            "You will then be asked to set a new master password (no keyfile is needed).",
             "",
             "KEEP SAFE",
             f"Fewer than {k} share(s) reveal nothing. {k} share(s) open the whole vault WITHOUT the",
-            "master password - store each sheet in a different secure place.",
+            "master password or keyfile - store each sheet in a different secure place.",
             "Never photograph them or type them anywhere except VaultTerm. The QR code holds the",
             "same text, for a keyboard-style barcode scanner during --recover.",
             "",
             "VALIDITY",
-            "Shares stay valid when you change the master password. Generating a new kit or",
-            "revoking it in the RECOVERY menu invalidates every sheet of this kit.",
+            "Shares stay valid when you change the master password or keyfile. Generating a new kit",
+            "or revoking it in the RECOVERY menu invalidates every sheet of this kit.",
             "The kit cannot bring back a vault destroyed by the deadman password.",
         ]
         y = 470
         for ln in info:
-            t(50, y, 11 if ln.isupper() and ln else 10, ln, "F2" if ln.isupper() and ln else "F1")
+            heading = bool(ln) and ln.isupper()
+            t(50, y, 11 if heading else 10, ln, "F2" if heading else "F1")
             y -= 16
         t(50, 60, 8, f"VaultTerm {VERSION} - kit {kit_id} - share {x}/{n}")
         pages.append("\n".join(ops).encode("ascii"))
@@ -1695,6 +1940,7 @@ GEN_PROFILES = {
 PW_LEN = (16, 128)
 PIN_LEN = (4, 12)
 PHRASE_WORDS = (5, 12)
+PHRASE_DEFAULT = 7
 
 
 def gen_password(length: int, profile: str = "high") -> Tuple[str, float]:
@@ -1785,7 +2031,7 @@ def estimate_bits(pw: str) -> float:
                 cost = char_bits + math.log2(L)
             if cost is not None:
                 ups = sum(c.isupper() for c in raw)
-                cost += 1.0 if (ups and ups == 1 and raw[0].isupper()) else min(ups, L)
+                cost += 1.0 if (ups == 1 and raw[0].isupper()) else min(ups, L)
                 if sub != low[j:i]:
                     cost += 1.0
                 best[i] = min(best[i], best[j] + cost)
@@ -1813,7 +2059,7 @@ def strength_line(bits: float) -> Text:
     t.append(f"  {label}  ~{bits:.0f} bits", style=color)
     return t
 
-# ── TOTP (RFC 6238, SHA-1, 6 digits, 30 s) ───────────────────────────────────
+# ── TOTP (RFC 6238: HMAC-SHA-1/256/512, 6 digits, 30 s) ──────────────────────
 
 
 def totp_key(secret: str) -> bytes:
@@ -1827,10 +2073,12 @@ def totp_key(secret: str) -> bytes:
     return key
 
 
-def totp_code(secret: str, at: Optional[float] = None, step: int = 30, digits: int = 6) -> str:
+def totp_code(secret: str, at: Optional[float] = None, algo: str = "SHA1", step: int = 30, digits: int = 6) -> str:
+    """The algorithm is chosen by the website, not by us. Most sites use SHA-1;
+    HMAC-SHA-1 remains a secure PRF for this purpose."""
     key = totp_key(secret)
     counter = int((time.time() if at is None else at) // step)
-    h = hmac.new(key, struct.pack(">Q", counter), hashlib.sha1).digest()
+    h = hmac.new(key, struct.pack(">Q", counter), TOTP_ALGOS[algo]).digest()
     o = h[-1] & 0x0F
     code = (struct.unpack(">I", h[o:o + 4])[0] & 0x7FFFFFFF) % (10 ** digits)
     return str(code).zfill(digits)
@@ -1942,7 +2190,7 @@ class Clipboard:
         except (OSError, subprocess.SubprocessError) as e:
             raise VaultError("CLIPBOARD", f"{kind}: {e}")
         self.used = True
-        digest = hashlib.sha256(data).digest()
+        digest = b2(data, b"vt5-clipboard", size=32)
         t = threading.Timer(clear_after, self._clear_if_ours, args=(digest,))
         t.daemon = True  # the exit paths clear the clipboard unconditionally
         t.start()
@@ -1965,7 +2213,7 @@ class Clipboard:
 
     def _clear_if_ours(self, digest: bytes):
         cur = self._paste()
-        if cur is not None and hmac.compare_digest(hashlib.sha256(cur).digest(), digest):
+        if cur is not None and hmac.compare_digest(b2(cur, b"vt5-clipboard", size=32), digest):
             self.clear_all()
 
     def clear_all(self):
@@ -1991,11 +2239,12 @@ class Clipboard:
 
 
 class App:
-    def __init__(self):
+    def __init__(self, keyfile_path: Optional[str] = None):
         self.term = Term()
         self.clip = Clipboard()
         self.vault: Optional[Vault] = None
         self.last_input = time.monotonic()
+        self.keyfile_path = keyfile_path or os.environ.get("VAULTTERM_KEYFILE")
 
     # ---- input helpers --------------------------------------------------------
 
@@ -2065,7 +2314,22 @@ class App:
             except Exception:
                 pass
         else:
-            seal_event(peek_event_pubkey(), {"type": "ERROR", "ts": utc_now(), "kind": e.kind, "detail": e.detail, "ref": e.ref})
+            core = peek_core()
+            seal_event(core["event_pub"] if core else None,
+                       {"type": "ERROR", "ts": utc_now(), "kind": e.kind, "detail": e.detail, "ref": e.ref})
+
+    def ask_keyfile(self, purpose: str = "keyfile path", timed: bool = True) -> bytearray:
+        """Prompt (default: --keyfile / $VAULTTERM_KEYFILE) and read a keyfile."""
+        while True:
+            path = self.ask(purpose, default=self.keyfile_path or None, timed=timed)
+            if not path:
+                continue
+            try:
+                kf = read_keyfile(path)
+                self.keyfile_path = path
+                return kf
+            except VaultError as e:
+                err(f"KEYFILE  {escape(e.detail)}")
 
     # ---- entry point ------------------------------------------------------------
 
@@ -2120,10 +2384,37 @@ class App:
             bits = estimate_bits(pw)
             console.print(strength_line(bits))
             if bits < MASTER_TARGET_BITS:
-                warn(f"estimated strength is below {MASTER_TARGET_BITS} bits. a 6-word passphrase from GENERATE [6] is a good choice.")
+                warn(f"estimated strength is below {MASTER_TARGET_BITS} bits (the target that keeps a margin even against "
+                     f"quantum search). a {PHRASE_DEFAULT}-word passphrase from GENERATE [6] gives ~{PHRASE_DEFAULT * 12.9:.0f} bits.")
                 if not self.confirm("use it anyway?", default=False):
                     continue
             return pw
+
+    def _ask_optional_keyfile(self, prompt: str) -> Optional[bytearray]:
+        console.print(f"\n  [{C_DIM}]an optional KEYFILE is a second factor: any file (e.g. random bytes on a USB stick)\n"
+                      f"  that must be present to unlock. lose it and only the paper recovery kit can open the vault.[/{C_DIM}]\n")
+        if not self.confirm(prompt, default=False):
+            return None
+        return self._keyfile_wizard()
+
+    def _keyfile_wizard(self) -> bytearray:
+        console.print(f"  [{C_KEY}][1][/{C_KEY}] generate a new random keyfile   [{C_KEY}][2][/{C_KEY}] use an existing file\n")
+        if self.ask("keyfile", default="1", choices=["1", "2"], show_default=False) == "1":
+            while True:
+                path = self.ask("where to create it (e.g. on a USB stick)")
+                if not path:
+                    continue
+                try:
+                    kf = create_keyfile(path)
+                    self.keyfile_path = path
+                    ok(f"keyfile created: {escape(os.path.abspath(os.path.expanduser(path)))} (mode 0400). "
+                       "keep a copy somewhere safe -- without it the vault needs the recovery kit.")
+                    return kf
+                except VaultError as e:
+                    err(f"KEYFILE  {escape(e.detail)}")
+        kf = self.ask_keyfile("path of the existing keyfile")
+        warn("the file must never change: editing it even by one byte locks you out.")
+        return kf
 
     def init_vault(self):
         console.print(f"  [{C_WARN}]NO VAULT DETECTED.[/{C_WARN}]")
@@ -2131,33 +2422,48 @@ class App:
         master = self._ask_new_password("master password", MASTER_MIN_LEN, None)
         console.print(f"\n  [{C_DIM}]the DEADMAN password, typed at the unlock prompt, silently destroys the vault.[/{C_DIM}]")
         deadman = self._ask_new_password("deadman password", MASTER_MIN_LEN, lambda p: p == master)
+        kf = self._ask_optional_keyfile("require a keyfile in addition to the master password?")
         console.print(f"\n  [{C_DIM}]deriving keys (Argon2id, 256 MiB)...[/{C_DIM}]")
-        self.vault = Vault.create(master, deadman)
+        self.vault = Vault.create(master, deadman, keyfile=kf)
+        wipe(kf)
         self.touch()
         ok("vault initialised.")
-        if self.confirm("create a printable paper recovery kit now? (also available later in RECOVERY [13])", default=False):
+        if self.confirm("create a printable paper recovery kit now? (also available later in RECOVERY [13])",
+                        default=self.vault.keyfile is not None):
             self._generate_kit()
 
     def unlock_interactive(self):
-        pub = peek_event_pubkey()
-        console.print(f"  [{C_DIM}]vault: {escape(str(P.vault))}[/{C_DIM}]\n")
+        core = peek_core()
+        need_kf = bool(core and core["keyfile"])
+        console.print(f"  [{C_DIM}]vault: {escape(str(P.vault))}{'  (keyfile required)' if need_kf else ''}[/{C_DIM}]\n")
         while True:
             pw = self.ask("master password", secret=True, timed=False)
             if not pw:
                 continue
+            kf = None
+            if need_kf:
+                path = self.ask("keyfile path", default=self.keyfile_path or None, timed=False)
+                if path:
+                    try:
+                        kf = read_keyfile(path)
+                        self.keyfile_path = path
+                    except VaultError as e:
+                        err(f"KEYFILE  {escape(e.detail)}")
             try:
-                vault = Vault.unlock(pw)
+                vault = Vault.unlock(pw, kf)
             except DeadmanTriggered:
                 self.deadman()
             except VaultError as e:
-                if e.kind == "AUTH_FAILED":
-                    err("AUTH_FAILED  authentication failed.")
-                    seal_event(pub, {"type": "UNLOCK_FAIL", "ts": utc_now()})
+                if e.kind in ("AUTH_FAILED", "KEYFILE"):
+                    err(f"{e.kind}  {escape(ERROR_TEXT[e.kind])}")
+                    seal_event(core["event_pub"] if core else None, {"type": "UNLOCK_FAIL", "ts": utc_now()})
                     continue
                 self.report(e, persist=True)
                 if e.kind == "VAULT_INTEGRITY":
                     console.print(f"  [{C_DIM}]if you have a backup:  ./start.sh --restore <file.vtbak>[/{C_DIM}]\n")
                 sys.exit(3)
+            finally:
+                wipe(kf)
             self.vault = vault
             self.touch()
             self.after_unlock(pw)
@@ -2165,8 +2471,9 @@ class App:
 
     def after_unlock(self, password: Optional[str]):
         v = self.vault
-        events, bad = unseal_events(v.data["event_privkey"])
+        events, bad = unseal_events(v.data["event_keys"])
         notes = housekeeping(v)
+        rb_status, rb_body = v.evaluate_rollback()
         fails = sum(1 for ev in events if ev.get("type") == "UNLOCK_FAIL")
         with v.transaction():
             for ev in events:
@@ -2179,11 +2486,33 @@ class App:
                 v.log("ERROR", detail=f"{bad} sealed pre-unlock event(s) could not be decrypted")
             for action, detail in notes:
                 v.log(action, detail=detail)
+            if rb_status == "rollback":
+                v.log("ROLLBACK_WARNING", detail=f"vault generation {v.data['generation']} < last seen {rb_body['generation']}")
+            elif rb_status == "tampered":
+                v.log("STATE_WARNING", detail=f"rollback record {P.state_file(v.vault_id)} is invalid or modified")
+            elif rb_status == "missing":
+                v.log("STATE_NEW", detail="no rollback record on this machine; one was created")
+            elif rb_status == "ahead":
+                v.log("STATE_AHEAD", detail=f"vault generation {v.data['generation']} is newer than the record "
+                                            f"({rb_body['generation']}): interrupted save or edited on another machine")
             v.log("UNLOCK")
         shred_file(P.events)
         ok("access granted.")
-        console.print(f"  [{C_DIM}]last saved {local_date(v.data['saved_at'])}  ·  generation {v.data['generation']}"
-                      f"  (a lower generation than you remember means an older copy was restored)[/{C_DIM}]")
+        console.print(f"  [{C_DIM}]last saved {local_date(v.data['saved_at'])}  ·  generation {v.data['generation']}[/{C_DIM}]")
+        if rb_status == "rollback":
+            console.print(f"\n  [bold {C_ERR}]!! ROLLBACK DETECTED !![/bold {C_ERR}]  this vault file is OLDER than the newest one this machine has seen\n"
+                          f"  (generation {rb_body['generation']}, saved {local_date(rb_body['saved_at'])}). someone may have put back an old copy:\n"
+                          f"  passwords changed since then would have reverted.\n")
+            if self.confirm("did YOU restore or copy this older vault on purpose? (accept it)", default=False):
+                v.accept_older_copy()
+                ok("accepted. the generation counter continues from the newest value.")
+            else:
+                warn("not accepted: this warning will repeat at every unlock. restore a recent backup from CLONE [9].")
+        elif rb_status == "tampered":
+            warn(f"the local rollback record ({escape(str(P.state_file(v.vault_id)))}) was modified or is unreadable. it has been rewritten.")
+            v.accept_rollback = True
+            v.record_state()
+            v.accept_rollback = False
         if fails:
             warn(f"{fails} failed unlock attempt(s) since your last session -- see LOG [7].")
         if any(a == "ERROR" for a, _ in notes):
@@ -2191,7 +2520,7 @@ class App:
         if password and kdf_weaker(v.header["core"]["kdf"]):
             warn("this vault uses weaker key-derivation parameters than recommended.")
             if self.confirm("upgrade now? (an automatic verified backup is made first)", default=True):
-                self.do_rekey(password)
+                self.do_rekey(password, v.keyfile)
         expired = [e for e in v.entries() if v.is_expired(e)]
         if expired:
             console.print(f"\n  [{C_WARN}]!! EXPIRY ALERT !! {len(expired)} secret(s) not rotated in {v.settings['expiry_days']}+ days.[/{C_WARN}]\n")
@@ -2209,6 +2538,13 @@ class App:
 
     def deadman(self):
         self.clip.clear_all()
+        core = peek_core()
+        if core:
+            shred_file(P.state_file(core["vault_id"]))
+            try:
+                P.state_dir.rmdir()
+            except OSError:
+                pass
         shred_tree(P.base)
         clr()
         ref = secrets.token_hex(3)
@@ -2233,7 +2569,7 @@ class App:
         ("5", "PURGE", "delete an entry"),
         ("6", "GENERATE", "password / PIN / passphrase generator"),
         ("7", "LOG", "tamper-evident audit trail and error details"),
-        ("8", "REKEY", "master/deadman password, KDF upgrade"),
+        ("8", "REKEY", "master/deadman password, keyfile, KDF upgrade"),
         ("9", "CLONE", "backups: create, verify, restore"),
         ("10", "TOTP", "live TOTP code display"),
         ("11", "HEALTH", "vault health check"),
@@ -2248,10 +2584,12 @@ class App:
         v = self.vault
         expired = sum(1 for e in v.data["entries"] if v.is_expired(e))
         ec = C_ERR if expired else C_OK
+        lock = v.settings["auto_lock_minutes"]
+        kf = f"  [{C_DIM}]keyfile[/{C_DIM}] on" if v.header["core"]["keyfile"] else ""
         console.print(f"  [{C_DIM}]entries[/{C_DIM}] [{C_HEAD}]{len(v.data['entries']):<4}[/{C_HEAD}]  "
                       f"[{C_DIM}]expired[/{C_DIM}] [{ec}]{expired:<4}[/{ec}]  "
                       f"[{C_DIM}]vault[/{C_DIM}] [{C_OK}]UNLOCKED[/{C_OK}]  "
-                      f"[{C_DIM}]auto-lock[/{C_DIM}] {v.settings['auto_lock_minutes'] or 'off'}{'m' if v.settings['auto_lock_minutes'] else ''}\n")
+                      f"[{C_DIM}]auto-lock[/{C_DIM}] {f'{lock}m' if lock else 'off'}{kf}\n")
         t = Table(box=box.SIMPLE, show_header=False, padding=(0, 1))
         t.add_column("K", width=4)
         t.add_column("CMD", width=10)
@@ -2294,7 +2632,7 @@ class App:
                 Text(printable(e["name"]), style=C_DATA), Text(printable(e["url"]) or "—", style=C_DIM),
                 Text(printable(e["login"]) or "—", style=C_LABEL),
                 Text(f"{age_days(e['rotated_at'])}d", style=C_ERR if exp else C_DIM),
-                Text("yes" if e["totp"] else "no", style=C_OK if e["totp"] else C_DIM),
+                Text(TOTP_LABEL[e["totp_algo"]] if e["totp"] else "no", style=C_OK if e["totp"] else C_DIM),
                 Text("[EXPIRED]", style=f"bold {C_ERR}") if exp else Text("[ACTIVE]", style=C_OK),
             )
         return t
@@ -2402,21 +2740,21 @@ class App:
         if e["totp"]:
             try:
                 rem = 30 - int(time.time()) % 30
-                row("TOTP", f"{totp_code(e['totp'])}  ({rem}s left -- use [10] for live display)", C_PW)
+                row("TOTP", f"{totp_code(e['totp'], algo=e['totp_algo'])}  ({TOTP_LABEL[e['totp_algo']]}, {rem}s left -- [10] for live)", C_PW)
             except VaultError:
                 row("TOTP", "[invalid secret]", C_ERR)
         att = e["attachment"]
         if att:
             row("FILE", f"{printable(att['filename'])}  ({human_size(att['size'])})", C_DATA)
-            row("SHA-256", att["sha256"], C_DIM)
+            row("BLAKE2b", att["b2"][:64], C_DIM)
+            row("", att["b2"][64:], C_DIM)
         if e["password"] and e["kind"] != "pin":
             console.print(strength_line(estimate_bits(e["password"])))
         console.print(sep + "\n")
         if att and att["size"] <= MAX_SHOW_TEXT and self.confirm("  show the key file content on screen?", default=False):
             data = self.vault.attachment_bytes(e)
             try:
-                txt = data.decode("utf-8")
-                console.print(Text(printable(txt, keep_newlines=True), style=C_PW))
+                console.print(Text(printable(data.decode("utf-8"), keep_newlines=True), style=C_PW))
             except UnicodeDecodeError:
                 warn("binary file -- use [X] export instead.")
         self.pause()
@@ -2439,7 +2777,7 @@ class App:
                 return
         atomic_write(target.absolute(), data)
         self.vault.log_and_save("EXPORT", e["id"], "secret key file exported")
-        ok(f"exported to {escape(str(target))} (mode 0600, sha-256 verified).")
+        ok(f"exported to {escape(str(target))} (mode 0600, BLAKE2b verified; compare with: b2sum).")
         warn("this copy is NOT encrypted. shred it when you no longer need it.")
         self.pause()
 
@@ -2451,21 +2789,32 @@ class App:
         return {"1": "password", "2": "pin", "3": "passphrase", "4": "secret_key"}[
             self.ask("type", default="1", choices=["1", "2", "3", "4"], show_default=False)]
 
-    def _ask_totp(self, prompt: str = "TOTP secret (hidden, base32, ENTER to skip)") -> Optional[str]:
+    def _ask_totp_algo(self, default: str = "SHA1") -> str:
+        console.print(f"  [{C_KEY}][1][/{C_KEY}] SHA-1 (most sites)   [{C_KEY}][2][/{C_KEY}] SHA-256   [{C_KEY}][3][/{C_KEY}] SHA-512\n")
+        d = {"SHA1": "1", "SHA256": "2", "SHA512": "3"}[default]
+        return {"1": "SHA1", "2": "SHA256", "3": "SHA512"}[
+            self.ask("TOTP algorithm", default=d, choices=["1", "2", "3"], show_default=False)]
+
+    def _ask_totp(self, prompt: str = "TOTP secret (hidden, base32, ENTER to skip)",
+                  current_algo: str = "SHA1") -> Optional[Tuple[str, str]]:
         while True:
             raw = self.ask(prompt, secret=True)
             if not raw.strip():
                 return None
             s = re.sub(r"[\s\-]", "", raw.upper())
             try:
-                code = totp_code(s)
+                totp_key(s)
             except VaultError as e:
                 err(escape(e.detail))
                 if not self.confirm("try again?", default=True):
                     return None
                 continue
-            ok(f"TOTP validated. current code: [{C_PW}]{code}[/{C_PW}] -- compare with your authenticator.")
-            return s
+            algo = self._ask_totp_algo(current_algo)
+            ok(f"current code: [{C_PW}]{totp_code(s, algo=algo)}[/{C_PW}] ({TOTP_LABEL[algo]}) -- compare with the site or your phone.")
+            if self.confirm("does it match?", default=True):
+                return s, algo
+            current_algo = algo
+            warn("try another algorithm: the site decides it (most use SHA-1; the setup page or QR link may say SHA256/SHA512).")
 
     def _ask_secret_file(self) -> Optional[Tuple[str, bytes, str]]:
         while True:
@@ -2494,7 +2843,7 @@ class App:
                 err("file too large.")
                 continue
             name = clean(os.path.basename(path))[:200] or "secret.key"
-            ok(f"read {escape(name)} ({human_size(len(data))}, sha-256 {hashlib.sha256(data).hexdigest()[:16]}...)")
+            ok(f"read {escape(name)} ({human_size(len(data))}, BLAKE2b {b2file_hex(data)[:16]}...)")
             return name, data, path
 
     def _manual_secret(self, kind: str) -> str:
@@ -2521,7 +2870,7 @@ class App:
             if kind == "pin":
                 pw, bits = gen_pin(self.ask_int("PIN length", 6, *PIN_LEN))
             elif kind == "passphrase":
-                pw, bits = gen_passphrase(self.ask_int("words", 6, *PHRASE_WORDS))
+                pw, bits = gen_passphrase(self.ask_int("words", PHRASE_DEFAULT, *PHRASE_WORDS))
             else:
                 console.print(f"  [{C_KEY}][1][/{C_KEY}] high entropy   [{C_KEY}][2][/{C_KEY}] max compatibility (safe symbols)   "
                               f"[{C_KEY}][3][/{C_KEY}] no symbols\n")
@@ -2568,7 +2917,7 @@ class App:
         url = clean(self.ask("url (optional)", default=""))
         login = clean(self.ask("login/email (optional)", default=""))
         notes = clean(self.ask("notes (optional)", default=""))
-        totp = self._ask_totp() or ""
+        totp = self._ask_totp()
         dupes = self.vault.duplicate_hits(name, url, login)
         if dupes:
             warn("possible duplicate entry detected.")
@@ -2602,13 +2951,16 @@ class App:
         console.print(Text(f"  LOGIN {printable(login) or '—'}", style=C_DATA))
         if password:
             console.print(Text(f"  VALUE {'*' * min(len(password), 32)} ({len(password)} chars)", style=C_DIM))
+        if totp:
+            console.print(Text(f"  TOTP  {TOTP_LABEL[totp[1]]}", style=C_DIM))
         if file:
             console.print(Text(f"  FILE  {printable(file[0])} ({human_size(len(file[1]))})", style=C_DATA))
         if not self.confirm("commit to vault?", default=True):
             inf("aborted.")
             self.pause()
             return
-        eid = self.vault.add_entry(kind, name, url, login, password, notes, totp, (file[0], file[1]) if file else None)
+        eid = self.vault.add_entry(kind, name, url, login, password, notes, totp[0] if totp else "",
+                                   (file[0], file[1]) if file else None, totp[1] if totp else "SHA1")
         ok(f"entry injected. id={eid}")
         if file:
             self._offer_delete_original(file[2])
@@ -2625,7 +2977,7 @@ class App:
             else:
                 ok("original file overwritten and deleted.")
 
-    def _keep_edit_clear(self, label: str, current: str, secret: bool) -> Optional[str]:
+    def _keep_edit_clear(self, label: str, current: str) -> Optional[str]:
         """Returns None to keep, otherwise the new value ('' clears)."""
         if current:
             console.print(f"  [{C_DIM}]{label}: {escape(f'[hidden, {len(current)} chars]')}[/{C_DIM}]")
@@ -2636,10 +2988,7 @@ class App:
                 return ""
         elif not self.confirm(f"add {label}?", default=False):
             return None
-        if label == "TOTP secret":
-            return self._ask_totp("new TOTP secret (hidden, base32)")
-        val = self.ask(f"new {label}", secret=secret)
-        return clean(val)
+        return clean(self.ask(f"new {label}"))
 
     def cmd_modify(self):
         banner()
@@ -2663,12 +3012,29 @@ class App:
         for fld in ("url", "login"):
             val = clean(self.ask(fld, default=e[fld]))
             ch[fld] = "" if val == "-" else val
-        notes = self._keep_edit_clear("notes", e["notes"], secret=False)
+        notes = self._keep_edit_clear("notes", e["notes"])
         if notes is not None:
             ch["notes"] = notes
-        totp = self._keep_edit_clear("TOTP secret", e["totp"], secret=True)
-        if totp is not None:
-            ch["totp"] = totp
+        if e["totp"]:
+            hidden = escape("[hidden, %d chars]" % len(e["totp"]))
+            console.print(f"  [{C_DIM}]TOTP: {hidden} · {TOTP_LABEL[e['totp_algo']]}[/{C_DIM}]")
+            a = self.ask("TOTP: [K]eep / [E]dit secret / [A]lgorithm only / [C]lear", default="k",
+                         choices=["k", "e", "a", "c"], show_default=False)
+            if a == "c":
+                ch["totp"] = ""
+                ch["totp_algo"] = "SHA1"
+            elif a == "a":
+                algo = self._ask_totp_algo(e["totp_algo"])
+                ok(f"code with {TOTP_LABEL[algo]}: [{C_PW}]{totp_code(e['totp'], algo=algo)}[/{C_PW}]")
+                ch["totp_algo"] = algo
+            elif a == "e":
+                t = self._ask_totp("new TOTP secret (hidden, base32)", e["totp_algo"])
+                if t:
+                    ch["totp"], ch["totp_algo"] = t
+        else:
+            t = self._ask_totp("TOTP secret (hidden, base32, ENTER to skip)")
+            if t:
+                ch["totp"], ch["totp_algo"] = t
         file = None
         if e["kind"] == "secret_key":
             if self.confirm("replace the stored key file?", default=False):
@@ -2768,7 +3134,7 @@ class App:
             self.pause()
             return
         try:
-            totp_code(e["totp"])
+            totp_code(e["totp"], algo=e["totp_algo"])
         except VaultError:
             err("invalid TOTP secret stored for this entry.")
             self.pause()
@@ -2776,20 +3142,22 @@ class App:
         self._totp_live(e)
 
     def _totp_live(self, e: Dict):
-        console.print(f"\n  [{C_DIM}]live TOTP for[/{C_DIM}] [{C_HEAD}]{escape(printable(e['name']))}[/{C_HEAD}]  [{C_DIM}]-- press ENTER to exit[/{C_DIM}]\n")
+        console.print(f"\n  [{C_DIM}]live TOTP ({TOTP_LABEL[e['totp_algo']]}) for[/{C_DIM}] [{C_HEAD}]{escape(printable(e['name']))}[/{C_HEAD}]"
+                      f"  [{C_DIM}]-- press ENTER to exit[/{C_DIM}]\n")
         G, Y, R, CY, B, D, X, EL = "\033[92m", "\033[93m", "\033[91m", "\033[96m", "\033[1m", "\033[2m", "\033[0m", "\033[K"
         width = max(10, min(30, (console.width or 80) - 36))
         last = None
+        algo = e["totp_algo"]
         try:
             while True:
                 self.check_lock()
                 now = time.time()
                 rem = 30 - int(now) % 30
-                code = totp_code(e["totp"], now)
+                code = totp_code(e["totp"], now, algo)
                 filled = int(rem / 30 * width)
                 bar = "[" + "#" * filled + "." * (width - filled) + "]"
                 col = R if rem <= 5 else (Y if rem <= 10 else G)
-                nxt = f"  {Y}next: {B}{totp_code(e['totp'], now + rem + 1)}{X}" if rem <= 5 else ""
+                nxt = f"  {Y}next: {B}{totp_code(e['totp'], now + rem + 1, algo)}{X}" if rem <= 5 else ""
                 sys.stdout.write(f"\r  {B}{R if rem <= 5 else CY}{code}{X}  {col}{bar}{X}  {D}{rem:2d}s{X}{nxt}{EL}")
                 sys.stdout.flush()
                 last = code
@@ -2813,7 +3181,7 @@ class App:
         v = self.vault
         good, count, bad_seq = v.verify_log()
         if good:
-            console.print(f"  [{C_OK}]hash chain verified[/{C_OK}] [{C_DIM}]({count} events kept, HMAC-SHA256 chained, stored inside the encrypted vault)[/{C_DIM}]\n")
+            console.print(f"  [{C_OK}]hash chain verified[/{C_OK}] [{C_DIM}]({count} events kept, keyed-BLAKE2b chained, stored inside the encrypted vault)[/{C_DIM}]\n")
         else:
             console.print(f"  [{C_ERR}]HASH CHAIN BROKEN at seq {bad_seq}[/{C_ERR}] -- the log was modified.\n")
         items = v.data["log"]["items"][-60:][::-1]
@@ -2821,7 +3189,8 @@ class App:
         for c in ("SEQ", "TIME", "ACTION", "ID", "REF", "DETAIL"):
             t.add_column(c)
         colors = {"ADD": C_OK, "EDIT": C_WARN, "PURGE": C_ERR, "REKEY": "magenta", "ERROR": C_ERR,
-                  "UNLOCK_FAIL": C_ERR, "RESTORED": "magenta", "RECOVERY_USED": "magenta"}
+                  "UNLOCK_FAIL": C_ERR, "RESTORED": "magenta", "RECOVERY_USED": "magenta",
+                  "ROLLBACK_WARNING": C_ERR, "STATE_WARNING": C_ERR}
         for it in items:
             det = printable(it.get("detail") or "")
             t.add_row(Text(str(it["seq"]), style=C_DIM), Text(local_date(it["ts"]), style=C_DIM),
@@ -2846,81 +3215,98 @@ class App:
     def cmd_rekey(self):
         banner()
         header("REKEY -- KEYS AND PASSWORDS")
-        p = self.vault.header["core"]["kdf"]
+        v = self.vault
+        p = v.header["core"]["kdf"]
         r = ARGON2_RECOMMENDED
+        has_kf = v.header["core"]["keyfile"]
         console.print(f"  [{C_DIM}]current KDF: argon2id t={p['time_cost']} m={p['memory_cost']}KiB p={p['parallelism']}"
-                      f"   recommended: t={r['time_cost']} m={r['memory_cost']}KiB p={r['parallelism']}[/{C_DIM}]\n")
+                      f"   recommended: t={r['time_cost']} m={r['memory_cost']}KiB p={r['parallelism']}"
+                      f"   keyfile: {'yes' if has_kf else 'no'}[/{C_DIM}]\n")
         console.print(f"  [{C_KEY}][1][/{C_KEY}] change master password (rotates the data key, re-encrypts everything)\n"
                       f"  [{C_KEY}][2][/{C_KEY}] change deadman password\n"
                       f"  [{C_KEY}][3][/{C_KEY}] upgrade KDF parameters / rotate data key (same password)\n"
-                      f"  [{C_KEY}][B][/{C_KEY}] back\n")
-        c = self.ask("option", default="b", choices=["1", "2", "3", "b"], show_default=False)
+                      f"  [{C_KEY}][4][/{C_KEY}] {'replace the keyfile' if has_kf else 'add a keyfile (second factor)'}\n"
+                      + (f"  [{C_KEY}][5][/{C_KEY}] remove the keyfile requirement\n" if has_kf else "")
+                      + f"  [{C_KEY}][B][/{C_KEY}] back\n")
+        c = self.ask("option", default="b", choices=["1", "2", "3", "4", "5", "b"] if has_kf else ["1", "2", "3", "4", "b"], show_default=False)
         if c == "b":
             return
         cur = self.ask("current master password", secret=True)
-        if not self.vault.verify_master(cur):
+        if not v.verify_master(cur):
             raise VaultError("AUTH_FAILED", "REKEY: current master password rejected")
         if c == "1":
-            dm = self.vault.header["core"]["deadman"]
+            dm = v.header["core"]["deadman"]
             new = self._ask_new_password("master password", MASTER_MIN_LEN, lambda pw: deadman_matches(pw, dm))
             if self.confirm("make a verified backup, then re-encrypt the vault with the new password?", default=True):
-                self.do_rekey(new)
+                self.do_rekey(new, v.keyfile)
         elif c == "2":
-            new = self._ask_new_password("deadman password", MASTER_MIN_LEN, lambda pw: self.vault.verify_master(pw))
-            self.vault.change_deadman(new)
+            new = self._ask_new_password("deadman password", MASTER_MIN_LEN, lambda pw: v.verify_master(pw))
+            v.change_deadman(new)
             ok("deadman password changed.")
+        elif c == "3":
+            self.do_rekey(cur, v.keyfile)
+        elif c == "4":
+            kf = self._keyfile_wizard()
+            if self.confirm("make a verified backup, then re-encrypt the vault to require this keyfile?", default=True):
+                self.do_rekey(cur, kf)
+            wipe(kf)
         else:
-            self.do_rekey(cur)
+            if self.confirm("remove the keyfile requirement? (verified backup first)", default=False):
+                self.do_rekey(cur, None)
         self.pause()
 
-    def do_rekey(self, new_password: str):
+    def do_rekey(self, new_password: str, keyfile):
         v = self.vault
+        kf = bytearray(keyfile) if keyfile is not None else None
         console.print(f"\n  [{C_DIM}]1/3 creating verified safety backup...[/{C_DIM}]")
         try:
             path, info = create_backup(v, "pre-rekey")
             info.wipe()
         except VaultError as e:
+            wipe(kf)
             self.report(e)
             err("rekey aborted before any change: the safety backup could not be created. the vault is unchanged.")
             return
         console.print(f"  [{C_DIM}]2/3 rotating data key, re-encrypting vault and attachments...[/{C_DIM}]")
         old_salt = v.header["core"]["salt"]
         try:
-            old_keys = v.rekey(new_password, ARGON2_RECOMMENDED)
+            old_keys = v.rekey(new_password, ARGON2_RECOMMENDED, kf)
         except VaultError as e:
             self.report(e)
-            err(f"rekey failed. the vault is unchanged and still opens with the OLD password. safety backup: {escape(path.name)}")
+            err(f"rekey failed. the vault is unchanged and still opens with the OLD credentials. safety backup: {escape(path.name)}")
             return
         except KeyboardInterrupt:
             if v.header["core"]["salt"] == old_salt:
-                err("rekey interrupted. the vault is unchanged and still opens with the OLD password.")
+                err("rekey interrupted. the vault is unchanged and still opens with the OLD credentials.")
             else:
-                warn("interrupted right after the commit: the vault now opens with the NEW password; "
-                     "backups were not converted (the pre-rekey backup opens with the old one).")
+                warn("interrupted right after the commit: the vault now opens with the NEW credentials; "
+                     "backups were not converted (the pre-rekey backup opens with the old ones).")
             return
-        console.print(f"  [{C_DIM}]3/3 re-encrypting backups to the new password...[/{C_DIM}]")
+        finally:
+            wipe(kf)
+        console.print(f"  [{C_DIM}]3/3 re-encrypting backups to the new credentials...[/{C_DIM}]")
         try:
             converted, stale = convert_backups(old_keys, v)
         except VaultError as e:
             self.report(e)
             converted, stale = [], []
-            warn("the vault was re-keyed, but converting backups failed. old backups may still use the OLD password.")
+            warn("the vault was re-keyed, but converting backups failed. old backups may still use the OLD credentials.")
         finally:
             old_keys.wipe()
         with v.transaction():
-            v.log("BACKUPS_CONVERTED", detail=f"{len(converted)} converted, {len(stale)} still on older passwords")
-        ok(f"vault re-keyed. {len(converted)} backup(s) now open with the new password.")
+            v.log("BACKUPS_CONVERTED", detail=f"{len(converted)} converted, {len(stale)} still on older credentials")
+        ok(f"vault re-keyed. {len(converted)} backup(s) now open with the new credentials.")
         if stale:
-            warn(f"{len(stale)} backup(s) use an older password and were not converted:")
+            warn(f"{len(stale)} backup(s) use older credentials and were not converted:")
             for s in stale:
                 console.print(Text(f"    {s.name}", style=C_DIM))
             if self.confirm("shred them now?", default=False):
                 for s in stale:
                     shred_file(s)
                 with v.transaction():
-                    v.log("BACKUP_SHRED", detail=f"{len(stale)} older-password backup(s) shredded")
+                    v.log("BACKUP_SHRED", detail=f"{len(stale)} older-credential backup(s) shredded")
                 ok("older backups shredded.")
-        warn("copies you placed OUTSIDE the vault folder still open with the old password.")
+        warn("copies you placed OUTSIDE the vault folder still open with the old credentials.")
 
     # ---- CLONE (backups) -------------------------------------------------------------------
 
@@ -2931,14 +3317,13 @@ class App:
             header("CLONE -- BACKUPS")
             backups = list_backups()
             t = Table(box=box.MINIMAL, show_header=True, header_style=f"bold {C_HEAD}", border_style=C_DIM, padding=(0, 1))
-            for c in ("#", "FILE", "DATE", "SIZE", "PASSWORD"):
+            for c in ("#", "FILE", "DATE", "SIZE", "CREDENTIALS"):
                 t.add_column(c)
             for i, b in enumerate(backups, 1):
                 cur = backup_uses_current_password(b, self.vault)
                 st = b.stat()
                 t.add_row(str(i), b.name, datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M"), human_size(st.st_size),
-                          Text("current" if cur else ("older" if cur is False else "unreadable"),
-                               style=C_OK if cur else C_WARN))
+                          Text("current" if cur else ("older" if cur is False else "unreadable"), style=C_OK if cur else C_WARN))
             if backups:
                 console.print(t)
             else:
@@ -2972,7 +3357,7 @@ class App:
             if not opened:
                 self.pause()
                 continue
-            info, other_password = opened
+            info, other_creds = opened
             console.print(f"  [{C_OK}]verified[/{C_OK}] [{C_DIM}]generation {info.data['generation']} · saved {local_date(info.data['saved_at'])} · "
                           f"{len(info.data['entries'])} entries · {len(info.data['blobs'])} attachment(s)[/{C_DIM}]\n")
             if a == "v":
@@ -2999,8 +3384,8 @@ class App:
             for action, detail in housekeeping(self.vault):
                 self.vault.log_and_save(action, detail=detail)
             ok(f"restored {escape(b.name)}. the previous vault was saved as {escape(pre.name)}.")
-            if other_password:
-                warn("you are now using the backup's master password (the one you just typed).")
+            if other_creds:
+                warn("you are now using the backup's master password (and keyfile, if any).")
             self.pause()
             return
 
@@ -3009,8 +3394,15 @@ class App:
         try:
             if backup_uses_current_password(path, v) and v.kek is not None:
                 return verify_backup(path, kek=v.kek, dek=v.keys.dek), False
-            pw = self.ask("this backup uses an older password -- enter it", secret=True)
-            return verify_backup(path, password=pw), True
+            pw = self.ask("this backup uses other credentials -- its master password", secret=True)
+            kf = None
+            core = backup_core(path)
+            if core and core.get("keyfile"):
+                kf = self.ask_keyfile("this backup needs a keyfile -- path")
+            try:
+                return verify_backup(path, password=pw, keyfile=kf), True
+            finally:
+                wipe(kf)
         except VaultError as e:
             self.report(e)
             return None
@@ -3028,10 +3420,17 @@ class App:
         banner()
         header("HEALTH CHECK")
         v = self.vault
+        core = v.header["core"]
         checks: List[Tuple[str, bool, str]] = []
-        checks.append(("vault file authenticated", True, "whole-vault AEAD verified at unlock"))
+        checks.append(("vault file authenticated", True, "ChaCha20-Poly1305 + BLAKE2b key commitment, verified at unlock"))
         good, count, bad = v.verify_log()
         checks.append(("audit log hash chain", good, f"{count} events" if good else f"broken at seq {bad}"))
+        rb, body = v.rollback_status()
+        checks.append(("rollback record", rb == "ok", {"ok": f"generation {body['generation'] if body else '?'} recorded",
+                                                       "rollback": "THIS VAULT IS OLDER THAN THE LAST ONE SEEN",
+                                                       "tampered": "record modified/unreadable",
+                                                       "missing": "no record on this machine",
+                                                       "ahead": "vault newer than record (interrupted save / other machine)"}[rb]))
         att_ok, att_bad = 0, []
         for e in v.data["entries"]:
             if e["attachment"]:
@@ -3041,23 +3440,23 @@ class App:
                 except VaultError as ex:
                     att_bad.append(f"#{e['id']}")
                     v.log_and_save("ERROR", e["id"], f"{ex.kind}: {ex.detail}", ex.ref)
-        checks.append(("attachments decrypt + hash", not att_bad, f"{att_ok} ok" + (f", FAILED: {', '.join(att_bad)}" if att_bad else "")))
+        checks.append(("attachments decrypt + BLAKE2b", not att_bad, f"{att_ok} ok" + (f", FAILED: {', '.join(att_bad)}" if att_bad else "")))
         perm = [self._perm_ok(P.base, 0o700), self._perm_ok(P.vault, 0o600)]
-        if P.blobs.exists():
-            perm.append(self._perm_ok(P.blobs, 0o700))
-            perm += [self._perm_ok(f, 0o600) for f in P.blobs.iterdir()]
-        if P.backups.exists():
-            perm.append(self._perm_ok(P.backups, 0o700))
-            perm += [self._perm_ok(f, 0o600) for f in P.backups.iterdir()]
+        for d in (P.blobs, P.backups):
+            if d.exists():
+                perm.append(self._perm_ok(d, 0o700))
+                perm += [self._perm_ok(f, 0o600) for f in d.iterdir()]
         checks.append(("permissions 0700/0600, owned by you", all(perm), f"{sum(perm)}/{len(perm)} paths"))
         checks.append(("core dumps disabled", _HARDENING["core_dumps_disabled"], "RLIMIT_CORE=0"))
         checks.append(("process non-dumpable", _HARDENING["non_dumpable"], "prctl(PR_SET_DUMPABLE, 0)"))
         sw, sw_ok = swap_status()
         checks.append(("swap", sw_ok, sw))
-        kdf = v.header["core"]["kdf"]
+        kdf = core["kdf"]
         checks.append(("KDF parameters", not kdf_weaker(kdf), f"t={kdf['time_cost']} m={kdf['memory_cost']}KiB p={kdf['parallelism']}"))
-        dmk = v.header["core"]["deadman"]["kdf"]
+        dmk = core["deadman"]["kdf"]
         checks.append(("deadman KDF parameters", not kdf_weaker(dmk), "change the deadman password to upgrade" if kdf_weaker(dmk) else "ok"))
+        checks.append(("keyfile (second factor)", True, "required" if core["keyfile"] else "not used (optional)"))
+        checks.append(("pre-unlock event sealing", True, "hybrid X25519 + ML-KEM-1024 (post-quantum)"))
         rec = v.data["recovery"]
         checks.append(("paper recovery kit", True, f"active: any {rec['threshold']} of {rec['shares']} (kit {rec['kit_id']})" if rec else "none (optional)"))
         t = Table(box=box.MINIMAL, show_header=True, header_style=f"bold {C_HEAD}", border_style=C_DIM, padding=(0, 1))
@@ -3068,7 +3467,7 @@ class App:
             t.add_row(name, Text("OK" if passed else "WARN", style=C_OK if passed else C_WARN), Text(det, style=C_DIM))
         console.print(t)
         ents = v.data["entries"]
-        weak = [e for e in ents if e["password"] and e["kind"] in ("password", "passphrase", "secret_key") and estimate_bits(e["password"]) < MASTER_TARGET_BITS]
+        weak = [e for e in ents if e["password"] and e["kind"] in ("password", "passphrase", "secret_key") and estimate_bits(e["password"]) < ENTRY_WEAK_BITS]
         expired = [e for e in ents if v.is_expired(e)]
         seen: Dict[str, int] = {}
         for e in ents:
@@ -3079,11 +3478,11 @@ class App:
         older = sum(1 for b in backups if backup_uses_current_password(b, v) is False)
         newest = int((time.time() - backups[0].stat().st_mtime) // 86400) if backups else None
         console.print(f"\n  [{C_DIM}]entries[/{C_DIM}]                {len(ents)}")
-        console.print(f"  [{C_DIM}]weak (< {MASTER_TARGET_BITS} bits)[/{C_DIM}]         {len(weak)}" + (f"  [{C_DIM}]ids: {', '.join(str(e['id']) for e in weak[:12])}[/{C_DIM}]" if weak else ""))
+        console.print(f"  [{C_DIM}]weak (< {ENTRY_WEAK_BITS} bits)[/{C_DIM}]         {len(weak)}" + (f"  [{C_DIM}]ids: {', '.join(str(e['id']) for e in weak[:12])}[/{C_DIM}]" if weak else ""))
         console.print(f"  [{C_DIM}]expired[/{C_DIM}]                {len(expired)}")
         console.print(f"  [{C_DIM}]sharing a password[/{C_DIM}]     {reused}")
         console.print(f"  [{C_DIM}]backups[/{C_DIM}]                {len(backups)}" + (f", newest {newest} day(s) old" if newest is not None else "")
-                      + (f", [{C_WARN}]{older} on an older password[/{C_WARN}]" if older else ""))
+                      + (f", [{C_WARN}]{older} on older credentials[/{C_WARN}]" if older else ""))
         console.print(f"  [{C_DIM}]vault generation[/{C_DIM}]       {v.data['generation']}\n")
         v.log_and_save("HEALTH", detail=f"{sum(1 for c in checks if not c[1])} warning(s)")
         self.pause()
@@ -3123,7 +3522,8 @@ class App:
         if rec:
             console.print(f"  [{C_OK}]active kit {rec['kit_id']}[/{C_OK}]: any {rec['threshold']} of {rec['shares']} share(s), created {local_date(rec['created_at'])}\n")
         else:
-            console.print(f"  [{C_DIM}]no recovery kit. a kit lets you open the vault with printed shares if you forget the master password.[/{C_DIM}]\n")
+            console.print(f"  [{C_DIM}]no recovery kit. a kit lets you open the vault with printed shares if you forget the master\n"
+                          f"  password or lose the keyfile.[/{C_DIM}]\n")
         console.print(f"  [{C_KEY}][G][/{C_KEY}] generate {'a NEW kit (old sheets stop working)' if rec else 'a kit'}   "
                       + (f"[{C_KEY}][R][/{C_KEY}] revoke kit   " if rec else "") + f"[{C_KEY}][B][/{C_KEY}] back\n")
         a = self.ask("action", default="b", choices=["g", "r", "b"] if rec else ["g", "b"], show_default=False)
@@ -3163,7 +3563,7 @@ class App:
         if qrcode is None:
             warn("python 'qrcode' not installed: sheets contain text shares only.")
         console.print(f"  [{C_DIM}]this PDF contains ALL shares, so it alone can open your vault. print it now,\n"
-                      f"  then let VaultTerm shred it. test a recovery with --recover on a copy if you like.[/{C_DIM}]\n")
+                      f"  then let VaultTerm shred it.[/{C_DIM}]\n")
         self.ask("press ENTER after printing to shred the PDF", default="", show_default=False)
         if self.confirm("shred the PDF now?", default=True):
             shred_file(target)
@@ -3197,11 +3597,17 @@ class App:
         ensure_dir(P.base)
         console.print(f"  [{C_DIM}]backup: {escape(str(path))}[/{C_DIM}]\n")
         pw = self.ask("master password of this backup", secret=True, timed=False)
+        kf = None
+        core = backup_core(path)
+        if core and core.get("keyfile"):
+            kf = self.ask_keyfile("this backup needs a keyfile -- path", timed=False)
         try:
-            info = verify_backup(path, password=pw)
+            info = verify_backup(path, password=pw, keyfile=kf)
         except VaultError as e:
             self.report(e, persist=False)
             sys.exit(3)
+        finally:
+            wipe(kf)
         console.print(f"  [{C_OK}]verified[/{C_OK}] [{C_DIM}]generation {info.data['generation']} · saved {local_date(info.data['saved_at'])} · "
                       f"{len(info.data['entries'])} entries · {len(info.data['blobs'])} attachment(s)[/{C_DIM}]\n")
         if not self.confirm("install this backup as the active vault?", default=False):
@@ -3260,7 +3666,9 @@ class App:
         ok("vault opened with the recovery kit. set a new master password now.")
         dm = self.vault.header["core"]["deadman"]
         new = self._ask_new_password("master password", MASTER_MIN_LEN, lambda pw: deadman_matches(pw, dm))
-        self.do_rekey(new)
+        kf = self._ask_optional_keyfile("require a keyfile from now on?")
+        self.do_rekey(new, kf)
+        wipe(kf)
         warn("the shares you just typed were exposed. consider generating a NEW kit in RECOVERY [13].")
         self.after_unlock(None)
 
@@ -3271,22 +3679,31 @@ def selftest() -> int:
     global P
     old_p = P
     tmp = tempfile.mkdtemp(prefix="vaultterm-selftest-")
-    P = Paths(Path(tmp) / "vault")
+    P = Paths(Path(tmp) / "vault", Path(tmp) / "state")
     fast = dict(ARGON2_MIN)
     try:
         assert totp_code("GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ", at=59, digits=8) == "94287082"
-        assert totp_code("GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ", at=1111111109, digits=8) == "07081804"
+        assert totp_code(base64.b32encode(b"12345678901234567890123456789012").decode(), at=59, algo="SHA256", digits=8) == "46119246"
+        assert totp_code(base64.b32encode(b"1234567890" * 6 + b"1234").decode(), at=59, algo="SHA512", digits=8) == "90693936"
+        assert hashlib.blake2b(b"abc").hexdigest().startswith("ba80a53f981c4d0d")
         secret = os.urandom(32)
         sh = shamir_split(secret, 3, 5)
         assert shamir_combine({x: y for x, y in sh[1:4]}) == secret
-        assert shamir_combine({x: y for x, y in sh[:2]}) != secret
         kid, k, x, y = decode_share(encode_share("0a1b2c3d", 3, 2, sh[1][1]))
         assert (kid, k, x, y) == ("0a1b2c3d", 3, 2, sh[1][1])
         assert estimate_bits("Password123!Password") < 40
-        assert estimate_bits(gen_passphrase(6)[0]) > 70
+        assert estimate_bits(gen_passphrase(7)[0]) > 80
+        k1, k2 = os.urandom(32), os.urandom(32)
+        try:
+            aead_open(k2, aead_seal(k1, b"x", b"aad"), b"aad")
+            raise AssertionError("key commitment not enforced")
+        except InvalidTag:
+            pass
         v = Vault.create("correct horse battery", "deadman deadman 1", fast)
+        seal_event(v.header["core"]["event_pub"], {"type": "UNLOCK_FAIL", "ts": "t"})
+        assert unseal_events(v.data["event_keys"])[0][0]["type"] == "UNLOCK_FAIL"
         eid = v.add_entry("secret_key", "ssh", "", "me", "", "", "", ("id_ed25519", b"KEYDATA" * 100))
-        v.add_entry("password", "mail", "", "me", "pw-one-xxxxxxxxx", "", "")
+        v.add_entry("password", "mail", "", "me", "pw-one-xxxxxxxxx", "", "JBSWY3DPEHPK3PXP", None, "SHA512")
         v.close()
         v = Vault.unlock("correct horse battery")
         assert v.attachment_bytes(v.get(eid)) == b"KEYDATA" * 100
@@ -3302,13 +3719,21 @@ def selftest() -> int:
             assert e.kind == "AUTH_FAILED"
         bpath, info = create_backup(v)
         info.wipe()
-        old = v.rekey("new master password", fast)
+        kf = create_keyfile(str(Path(tmp) / "kf"))
+        old = v.rekey("new master password", fast, kf)
         conv, stale = convert_backups(old, v)
         old.wipe()
         assert conv == [bpath] and not stale
-        assert verify_backup(bpath, password="new master password").data["entries"]
-        assert v.verify_log()[0]
-        assert build_recovery_pdf("0a1b2c3d", 2, 3, [(1, "VT4-AAAA")], "2026-01-01").startswith(b"%PDF-1.4")
+        assert verify_backup(bpath, password="new master password", keyfile=kf).data["entries"]
+        v.close()
+        try:
+            Vault.unlock("new master password")
+            raise AssertionError("keyfile not enforced")
+        except VaultError as e:
+            assert e.kind == "KEYFILE"
+        v = Vault.unlock("new master password", kf)
+        assert v.verify_log()[0] and v.rollback_status()[0] == "ok"
+        assert build_recovery_pdf("0a1b2c3d", 2, 3, [(1, "VT5-AAAA")], "2026-01-01").startswith(b"%PDF-1.4")
         v.close()
         print("selftest OK")
         return 0
@@ -3328,6 +3753,7 @@ def _raise_exit(signum, _frame):
 
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(prog="vaultterm", description="Offline terminal password vault (Linux).")
+    ap.add_argument("--keyfile", metavar="PATH", help="keyfile to offer by default when one is required")
     ap.add_argument("--restore", metavar="BACKUP", help="install a .vtbak backup as the active vault")
     ap.add_argument("--recover", action="store_true", help="open the vault with paper recovery shares")
     ap.add_argument("--selftest", action="store_true", help="run built-in crypto/format tests in a temp dir and exit")
@@ -3337,14 +3763,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.selftest:
         return selftest()
     if not sys.platform.startswith("linux"):
-        print("VaultTerm v4 supports Linux only.", file=sys.stderr)
+        print("VaultTerm supports Linux only.", file=sys.stderr)
         return 1
     if not sys.stdin.isatty():
         print("VaultTerm needs an interactive terminal.", file=sys.stderr)
         return 1
     signal.signal(signal.SIGTERM, _raise_exit)
     signal.signal(signal.SIGHUP, _raise_exit)
-    app = App()
+    app = App(args.keyfile)
     try:
         app.run(args)
     except (KeyboardInterrupt, EOFError):

@@ -23,8 +23,8 @@ if ! "$PYTHON_BIN" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) els
   exit 1
 fi
 
-if [[ -f SOURCE-SHA256SUMS ]]; then
-  echo "[SYS] verifying source files against SOURCE-SHA256SUMS..."
+if [[ -f SOURCE-B2SUMS ]]; then
+  echo "[SYS] verifying source files against SOURCE-B2SUMS..."
   ./verify.sh --source
 fi
 

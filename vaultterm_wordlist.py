@@ -6,7 +6,7 @@ Each word carries log2(7776) ~= 12.925 bits of entropy when chosen uniformly.
 """
 import hashlib
 
-WORDLIST_SHA256 = "abae49761b88f3f1ba31ef944bea1f61b795a3cd7e1cfb7d276ed45bf77967ba"
+WORDLIST_BLAKE2B = "652f4b03e587980a4ab8c91fe3948cd966e34dcf5ed68d32c74768c644392198b163bd524ee65c7a28f2a5d4d5ed5aa42a970fc20511279014bde13d569dfbaf"
 
 _RAW = """
 abacus abdomen abdominal abide abiding ability ablaze able abnormal abrasion abrasive abreast
@@ -680,5 +680,5 @@ zippy zips zit zodiac zombie zone zoning zookeeper zoologist zoology zoom
 WORDS = tuple(_RAW.split())
 
 if len(WORDS) != 7776 or len(set(WORDS)) != 7776 or \
-        hashlib.sha256("\n".join(WORDS).encode("ascii")).hexdigest() != WORDLIST_SHA256:
+        hashlib.blake2b("\n".join(WORDS).encode("ascii")).hexdigest() != WORDLIST_BLAKE2B:
     raise ImportError("EFF wordlist failed its integrity check")

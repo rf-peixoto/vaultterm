@@ -1,58 +1,51 @@
 # VaultTerm
 
 ```
-=========================================================================
-  VAULTTERM v4.0.0  //  ChaCha20-Poly1305  //  Argon2id  //  OFFLINE
-=========================================================================
+=====================================================================================
+  VAULTTERM v5.0.0  //  ChaCha20-Poly1305 + BLAKE2b  //  Argon2id  //  ML-KEM  //  OFFLINE
+=====================================================================================
 ```
 
 An offline password vault for the Linux terminal. No cloud, no accounts, no
 network code, no telemetry. One encrypted vault file.
 
-> **v4 is a fresh start.** It cannot read v3 vaults or v3 backups. Export what
-> you need from v3 by hand, then initialise a new v4 vault.
+> **v5 is a fresh start.** It cannot read v4 (or older) vaults or backups.
+> Copy what you need out of the old version by hand, then initialise a new vault.
 
 ---
 
 ## Contents
 
-1. [What changed in v4](#what-changed-in-v4)
+1. [What changed in v5](#what-changed-in-v5)
 2. [Security design](#security-design)
-3. [What an attacker with your files can and cannot learn](#what-an-attacker-with-your-files-can-and-cannot-learn)
-4. [Known limits](#known-limits)
-5. [Install, run, build, verify](#install-run-build-verify)
-6. [Using VaultTerm](#using-vaultterm)
-7. [Files on disk](#files-on-disk)
-8. [Tests](#tests)
-9. [Dependencies and licences](#dependencies-and-licences)
+3. [Post-quantum position](#post-quantum-position)
+4. [What an attacker with your files can and cannot learn](#what-an-attacker-with-your-files-can-and-cannot-learn)
+5. [Known limits](#known-limits)
+6. [Install, run, build, verify](#install-run-build-verify)
+7. [Using VaultTerm](#using-vaultterm)
+8. [Files on disk](#files-on-disk)
+9. [Tests](#tests)
+10. [Dependencies and licences](#dependencies-and-licences)
 
 ---
 
-## What changed in v4
+## What changed in v5
 
-| v3 problem | v4 |
+| Area | v5 |
 |---|---|
-| Auto-lock never fired: idle time at a prompt was never counted | Every prompt has a deadline. Idle for N minutes anywhere, whether at the menu, a "press ENTER" or the live TOTP view, and the vault locks: keys are wiped, the clipboard is cleared, the screen and scrollback are erased, and typed-ahead input is discarded. |
-| Nothing checked the vault as a whole (rows could be rolled back or deleted, settings changed) | The whole vault, including entries, settings, log and inner keys, is **one authenticated ciphertext**. Changing any byte makes it fail to open. |
-| Ctrl+C or a crash during REKEY could leave entries unreadable | **Random data key** wrapped by the master key. A rekey re-encrypts everything under a *new* data key, and a single atomic file rename is the commit point. Signals are deferred during the commit. |
-| 40-word passphrase list (~40 bits), naive strength meter | **EFF large wordlist** (7,776 words, 12.9 bits/word; default 6 words ≈ 78 bits). Pattern-based strength estimator (dictionary words, common passwords, years, sequences, keyboard runs, repeats). Generators show their exact entropy. |
-| Identical passwords had identical hashes in the DB | The history hashes are keyed per entry (`HMAC(key, uuid ‖ password)`) **and** stored inside the encrypted vault. Reuse is detected by comparing decrypted values in memory. |
-| Ciphertext length showed password/notes length and empty fields | The vault is padded to 32 KiB buckets and attachments to size buckets. There are no per-field ciphertexts on disk any more. |
-| MODIFY printed the TOTP secret and notes | Shown as `[hidden, N chars]` with Keep / Edit / Clear. TOTP input is not echoed. URL/notes/TOTP can now be cleared. |
-| Missing or mismatched files handled silently | Generic error with a type and reference on screen (`[ERR] VAULT_MISSING ... (ref 3fa9c1)`), with full details in the encrypted LOG. The app refuses to create a new vault over leftover data. |
-| REKEY never upgraded KDF parameters | REKEY always uses the current recommended parameters, after an **automatic verified backup**. Weaker vaults are offered an upgrade at unlock. Out-of-range parameters are rejected before any derivation. |
-| Old backups opened with the old password after rekey; "verify" only listed file names | After a rekey, backups in `backups/` are **re-encrypted to the new password**. Backups on older passwords are listed and can be shredded. Verify now authenticates the vault and decrypts every attachment. A restore always backs up the current vault first. |
-| Clipboard not cleared if you exited quickly | Clipboard and primary selection are cleared on EJECT (always), on auto-lock, and on any exit after a copy. The 30 s timer still clears it only if the clipboard still holds the value VaultTerm put there. |
-| Manual entry passwords had to be ≥ 12 chars | Any length is accepted, with a warning under 12. |
-| Revealed passwords stayed in scrollback; core dumps possible | `ESC[3J` scrollback wipe on every screen change. `RLIMIT_CORE=0` and `PR_SET_DUMPABLE=0`. |
-| Deadman message didn't hold up | Identical to a genuine corruption error: *"vault database corrupted ... reinstall VaultTerm and initialise a new vault."* |
-| 5-attempt limit (cosmetic) | Removed. Failed attempts are recorded (sealed, see below) and reported after the next successful unlock. |
-| Corrupt meta.json crashed with a traceback | Strict header/payload validation returns typed errors. Unexpected exceptions are reported as `INTERNAL` with the traceback stored only in the encrypted LOG. |
-| Unpinned dependencies, smoke test that could never fail | `requirements*.txt` pinned with SHA-256 hashes, wheels only. `compile.sh` runs the full test suite and a real binary self-test in a throw-away `HOME`. |
-| Plaintext audit log | Encrypted with the vault and **HMAC hash-chained**. LOG shows whether the chain verifies. |
-| *(new)* | Reproducible single-file ELF build with `SHA256SUMS`, `SOURCE-SHA256SUMS`, optional GPG signatures, and `verify.sh`. |
-| *(new)* | Optional **paper recovery kit**: Shamir k-of-n shares, auto-generated printable PDF with QR codes. |
-| *(new)* | **Secret keys**: encrypt any file (SSH/GPG keys, recovery codes, ...) as a new entry type. |
+| **Hashes** | Every hash, MAC and KDF is BLAKE2b-based: HKDF-BLAKE2b-512 for all sub-keys, keyed BLAKE2b-512 for the log chain, password history and rollback record, BLAKE2b-512 for attachment and release checksums (`B2SUMS`, compatible with `b2sum`). Argon2id is itself built on BLAKE2b. The only SHA-2/SHA-1 left are where a standard dictates it (see below). |
+| **Key commitment** | Every ciphertext carries a 32-byte keyed-BLAKE2b commitment to its key, nonce and associated data. ChaCha20-Poly1305 on its own lets a specially crafted ciphertext decrypt under two different keys; v5 rejects that. |
+| **Post-quantum sealing** | Pre-unlock events (failed unlocks, early errors) are sealed with a **hybrid X25519 + ML-KEM-1024** KEM. They stay confidential as long as either algorithm holds. |
+| **Post-quantum release signatures** | `compile.sh --pq-sign` adds **ML-DSA-87** (FIPS 204) signatures next to the GPG ones. `verify.sh --pq-pub` checks them. |
+| **Password strength target** | Master and deadman passwords are now held to **80 bits** (estimated), up from 60. The default generated passphrase is 7 EFF words (≈ 90 bits). |
+| **Optional keyfile** | A second factor: any file (for example 64 random bytes on a USB stick) whose BLAKE2b digest is mixed into the key derivation. It can be added, replaced or removed in REKEY. The deadman password works without it. |
+| **Rollback detection** | A keyed record outside the vault folder remembers the BLAKE2b of the last vault file this machine wrote and the highest generation seen. An older copy put back in place triggers **ROLLBACK DETECTED** at every unlock until you explicitly accept it. |
+| **TOTP** | The algorithm is now chosen per entry: SHA-1 (default, what most sites use), SHA-256 or SHA-512. A wrong guess is caught because VaultTerm shows the code and asks whether it matches before saving. |
+
+v4's fixes all carry over: the auto-lock deadline on every prompt, the whole
+vault as one authenticated ciphertext, the random data key with atomic rekey,
+the EFF wordlist, padding, typed errors with details in the LOG, verified
+backups, clipboard clearing, core-dump protection, and the reproducible build.
 
 ---
 
@@ -61,58 +54,72 @@ network code, no telemetry. One encrypted vault file.
 ### Keys
 
 ```
-master password ──Argon2id(salt, t=3, m=256 MiB, p=4)──► KEK ─┐
-                                                              ├─ wraps ─► DEK (random 256-bit data key)
-recovery key (optional, 256-bit random, Shamir-split) ─HKDF─► ─┘                │
-                                                                                ├─HKDF─► payload key
-                                                                                └─HKDF─► attachment key
-inside the encrypted payload:  history-HMAC key · log-HMAC key · event private key (X25519)
+master password ─Argon2id(salt, t=3, m=256 MiB, p=4)─► 64 B ─┐
+optional keyfile ─BLAKE2b-512─────────────────────────────────┴─HKDF-BLAKE2b─► KEK ─┐
+                                                                                    ├ wraps ► DEK (random 256-bit)
+recovery key (optional, random 256-bit, Shamir-split) ─HKDF-BLAKE2b───────────────► ┘          │
+                                                                                               ├─HKDF-BLAKE2b─► payload key
+                                                                                               └─HKDF-BLAKE2b─► attachment key
+inside the encrypted payload: history-MAC key · log-MAC key · rollback-record key ·
+                              event private keys (X25519 + ML-KEM-1024 seed)
 ```
 
-* **Cipher**: ChaCha20-Poly1305 with random 96-bit nonces (the payload is re-encrypted on every save).
-* **Argon2id**, from `cryptography`'s OpenSSL backend. Parameters live in the header and are bound into the key wrap. Values outside `t ∈ [2,64]`, `m ∈ [64 MiB, 4 GiB]`, `p ∈ [1,16]` are rejected before deriving, which blocks downgrade and memory-exhaustion tampering.
-* **Rekey** rotates the DEK as well as the password: an old backup plus the old password does **not** decrypt anything written after the rekey.
-* Passwords are Unicode-NFC-normalised before derivation, so the same password typed on different keyboards/locales gives the same key.
+* **AEAD** = ChaCha20-Poly1305 (random 96-bit nonce) + keyed-BLAKE2b key commitment: `nonce ‖ commit ‖ ciphertext ‖ tag`.
+* **Argon2id** parameters live in the header and are bound into the key wrap. Values outside `t ∈ [2,64]`, `m ∈ [64 MiB, 4 GiB]`, `p ∈ [1,16]` are rejected before any derivation, which blocks downgrade and memory-exhaustion tampering.
+* **Rekey** rotates the data key as well as the password, keyfile or KDF parameters. An old backup plus an old password decrypts nothing written afterwards.
+* Passwords are Unicode-NFC-normalised before derivation.
 
 ### Vault file (`vault.vt`)
 
 ```
-"VTVAULT\x04" | u32 header length | header (canonical JSON) | nonce | ChaCha20-Poly1305(payload)
+"VTVAULT\x05" | u32 header length | header (canonical JSON) | AEAD(payload)
 ```
 
-* **Header** (plaintext, authenticated): format, KDF parameters, salt, the wrapped DEK(s), deadman verifier, the public key for sealed events, recovery-kit id. The whole header is the payload's AAD, and its `core` is the AAD of every key wrap, so editing any header field makes unlocking fail.
-* **Payload** (encrypted): every entry, settings, password history, the hash-chained log, inner keys, and the SHA-256 of every attachment blob. It is padded to a multiple of 32 KiB.
-* **Saves are atomic**: write a private temp file, `fsync`, `rename`, `fsync` the directory. Ctrl+C/SIGTERM/SIGHUP are deferred during the rename so memory and disk can never disagree.
+* **Header** (plaintext, authenticated): format, vault id, KDF parameters, salt, whether a keyfile is required, wrapped DEK(s), the deadman verifier, the public keys for sealed events, and the recovery-kit id. The whole header is the payload's associated data, and its `core` is bound into every key wrap.
+* **Payload** (encrypted, padded to 32 KiB buckets): entries, settings, history, the hash-chained log, inner keys, and the BLAKE2b-512 of every attachment.
+* **Saves are atomic**: private temp file, `fsync`, `rename`, `fsync` of the directory. Signals are deferred during the commit.
 
-### Attachments (`blobs/<random-id>.blob`)
+### Rollback record (`~/.config/vaultterm/<vault-id>.state`)
 
-Encrypted with the attachment key, AAD-bound to their random id, and padded
-(powers of two up to 1 MiB, then whole MiB). Their ciphertext hash lives in
-the authenticated payload, so a swapped, rolled-back or corrupted blob is
-detected.
+Keyed-BLAKE2b-authenticated `{generation (highest seen), BLAKE2b of the last vault file written, pending}`.
 
-### Sealed pre-unlock events (`events.sealed`)
-
-Failed unlock attempts and errors that happen *before* unlock can't go into
-the encrypted log (no key yet). They are sealed to the vault's X25519 public
-key, so they can be written but not read without unlocking. After the next
-unlock they are imported into the LOG and the file is shredded.
+* At unlock, the vault you opened must be that exact file. Otherwise:
+  * if its generation is not newer than the record, it is **rollback**;
+  * if it is newer, it is **ahead**, meaning an interrupted save or an edit made on another machine. That is noted in the LOG.
+* While a rollback is unaccepted, the record keeps the evidence (`pending`). Working on the old copy, even past the recorded generation, cannot erase the warning.
+* Restoring a backup on purpose continues the generation counter, so it never looks like a rollback.
 
 ### Deadman password
 
-Has its own salt and Argon2id parameters. It is only checked when the master
-password fails, so a wrong password always costs two derivations and a correct
-master costs one. When it matches, the whole vault folder, backups included,
-is shredded and the generic `VAULT_INTEGRITY` corruption message is printed.
-Symlinks are never followed while shredding.
+It has its own salt and KDF parameters and never needs the keyfile, so it works under coercion. It is checked only when the master password fails. When it matches:
+
+1. The vault folder, backups and the rollback record are shredded, without following symlinks.
+2. The generic `VAULT_INTEGRITY` corruption message is printed.
 
 ### Process hardening
 
-`umask 077`, no core dumps (`RLIMIT_CORE=0`), non-dumpable process
-(`PR_SET_DUMPABLE=0`: no `ptrace`, no `/proc/<pid>/mem` for other processes of
-your user), no terminal escape sequences from stored data (all control
-characters are neutralised before printing), and the scrollback is wiped on
-every screen change.
+`umask 077`, `RLIMIT_CORE=0`, `PR_SET_DUMPABLE=0`, control characters in stored
+data neutralised before printing, and the scrollback wiped on every screen change.
+
+---
+
+## Post-quantum position
+
+| Mechanism | Primitive | After a large quantum computer |
+|---|---|---|
+| Vault and attachment encryption | ChaCha20-Poly1305, 256-bit keys | ≈ 128-bit security (Grover); safe |
+| All hashing, MACs, KDFs | BLAKE2b-512 (keyed / HKDF) | safe |
+| Password stretching | Argon2id, 256 MiB | Grover can at most halve the password's bits, and running 256 MiB Argon2 on a quantum computer is wildly impractical. The 80-bit target keeps a margin anyway. |
+| Pre-unlock event sealing | X25519 **+ ML-KEM-1024** hybrid | safe while ML-KEM holds |
+| Paper recovery | Shamir over GF(256) | information-theoretic; unaffected |
+| Release signatures | GPG (Ed25519/RSA) **+ ML-DSA-87** | the ML-DSA signature stays valid |
+| TOTP | HMAC-SHA-1/256/512, as the site dictates | the 6-digit code is the limit, not the hash; unaffected |
+
+**Where SHA-2/SHA-1 remain, and why:**
+
+* **TOTP** must use exactly the algorithm the website uses (RFC 6238 defines SHA-1, SHA-256 and SHA-512). No authenticator or website supports BLAKE2.
+* **`requirements*.txt`**: pip's `--require-hashes` only accepts SHA-2, and PyPI publishes SHA-256.
+* **GPG** signatures use SHA-512 (`--digest-algo SHA512`), because GnuPG has no BLAKE2.
 
 ---
 
@@ -120,25 +127,23 @@ every screen change.
 
 | Visible without the master password | Hidden |
 |---|---|
-| That this is a VaultTerm v4 vault, its KDF parameters | Number of entries (to within the 32 KiB bucket) |
-| Whether a paper recovery kit exists | Names, URLs, logins, passwords, notes, TOTP secrets, entry types |
-| Number of attachments and their *padded* sizes | Settings, history, audit log, timestamps |
-| File modification times (filesystem metadata) | Which entries share a password |
-| Size of `events.sealed` (≈ number of failed unlocks since the last session) | Contents of those events |
+| That this is a VaultTerm v5 vault; its KDF parameters; whether a keyfile is required; whether a recovery kit exists | Number of entries (to within 32 KiB) |
+| Number of attachments and their *padded* sizes | Names, URLs, logins, passwords, notes, TOTP secrets and algorithms, entry types |
+| File times; size of `events.sealed` (≈ failed unlocks since the last session) | Settings, history, audit log, timestamps, event contents |
+| The rollback record's generation number | Which entries share a password |
 
 ---
 
 ## Known limits
 
-Be clear about these:
-
-* **Whole-file rollback.** Replacing `vault.vt` with an *older complete copy* (for example an old backup) produces a vault that opens normally; that's how restore works. VaultTerm shows the **generation number** and last-saved time at every unlock. If the generation is lower than you remember, an older copy was put back.
-* **Memory.** Python cannot reliably erase strings. Key buffers are zeroed on lock, but decrypted values may stay in process memory until reused. Disabling core dumps and ptrace removes the easy ways to read them. Use **encrypted swap** (or zram/no swap); HEALTH reports what it finds.
-* **Shredding** (deadman, deleted originals, old backups) overwrites then unlinks. On SSDs, journaling and copy-on-write filesystems the old blocks may survive. **Full-disk encryption (LUKS) is the real protection for data at rest.**
-* **Deadman vs a disk image.** Someone who copied your files *before* you typed the deadman password still has them, and offline brute force against the copy is limited only by your master password's strength.
-* **Clipboard managers** (Klipper, GPaste, CopyQ, ...) may keep their own history regardless of auto-clear. Clipboard use is off by default.
-* **Copies outside `~/.vaultterm/backups`** are not re-encrypted on rekey. They keep opening with the password they were made under.
-* **Verifying the program.** A modified binary can lie about its own hash, so self-checks prove nothing. Trust comes from checking `SHA256SUMS` (and its GPG signature) **with tools you already trust, before running anything**. See below.
+* **Rollback across machines.** The rollback record is per machine. A copy moved to a machine that has never opened this vault has nothing to compare against. The generation number shown at every unlock is the manual check.
+* **Memory.** Python cannot reliably erase strings. Key buffers are zeroed on lock, but decrypted values may linger in process memory. Core dumps and ptrace are disabled. Use **encrypted swap** (or zram/none); HEALTH reports what it finds.
+* **Shredding** is overwrite + unlink. On SSDs, journaling and copy-on-write filesystems old blocks may survive. **Full-disk encryption (LUKS) is the real protection at rest.**
+* **Deadman vs a disk image.** Anything copied before the deadman password was typed survives.
+* **Keyfile.** If you lose it, only the paper recovery kit opens the vault. The file must never change (a single byte locks you out), so keep a copy somewhere safe.
+* **Clipboard managers** may keep their own history. Clipboard use is off by default.
+* **Copies outside `~/.vaultterm/backups`** are not re-encrypted on rekey.
+* **Verifying the program.** A modified binary can lie about itself. Trust comes from checking `B2SUMS` and its signatures with tools you already trust, before running anything.
 
 ---
 
@@ -146,68 +151,78 @@ Be clear about these:
 
 ### Requirements
 
-Linux, Python 3.10+. For the clipboard: `wl-clipboard` (Wayland) or `xclip` /
-`xsel` (X11).
+Linux, Python 3.10+, GNU coreutils (`b2sum`). For the clipboard: `wl-clipboard`
+(Wayland) or `xclip` / `xsel` (X11).
 
 ### Run from source
 
 ```bash
-./verify.sh --source        # if the release ships SOURCE-SHA256SUMS(.asc)
-./install.sh                # .venv + hash-pinned wheels only + selftest
-./start.sh
+./verify.sh --source [--pq-pub vaultterm-release.pub]   # if the release ships SOURCE-B2SUMS
+./install.sh                                            # .venv + hash-pinned wheels only + selftest
+./start.sh                                              # or: ./start.sh --keyfile /media/usb/vault.key
 ```
 
-`start.sh` refuses to run if `SOURCE-SHA256SUMS` is present and the files don't
-match. That only catches accidental or naive changes: anyone able to edit
-`vaultterm.py` can edit `start.sh` too.
+`start.sh` refuses to run if `SOURCE-B2SUMS` is present and the files don't
+match. That only catches accidental changes; real assurance comes from the
+signatures.
 
 ### Build the ELF binary
 
 ```bash
-./compile.sh                       # dist/vaultterm + SHA256SUMS + SOURCE-SHA256SUMS + BUILDINFO
-./compile.sh --sign                # + GPG-signed SHA256SUMS.asc / SOURCE-SHA256SUMS.asc
-./compile.sh --sign-key 0xABCD1234
-./compile.sh --onedir              # directory bundle instead of one file
+./compile.sh                                    # dist/vaultterm + B2SUMS + SOURCE-B2SUMS + BUILDINFO
+./compile.sh --sign                             # + GPG signatures (*.asc)
+./compile.sh --sign --pq-sign vaultterm-release.key   # + ML-DSA-87 signatures (*.mldsa) + the .pub
+./compile.sh --onedir                           # directory bundle instead of one file
 ```
 
-What it does:
+The build:
 
-1. Creates a separate build venv and installs **only** the hash-pinned wheels in `requirements.txt` + `requirements-build.txt`.
-2. Runs the unit tests and the source self-test. The build stops on failure.
-3. Builds with PyInstaller using `SOURCE_DATE_EPOCH` (last git commit, else the source mtime) and `PYTHONHASHSEED=0`.
-4. Runs `dist/vaultterm --version` and `--selftest` with an empty environment and a throw-away `HOME`, so your real vault is never touched. Any failure stops the build.
-5. Writes `SHA256SUMS` (binary), `SOURCE-SHA256SUMS` (the exact sources), `BUILDINFO` (Python, distro, glibc, every package version), and signatures if requested.
+1. Installs **only** hash-pinned wheels into a separate build venv.
+2. Runs the unit tests and the source self-test.
+3. Builds with PyInstaller using `SOURCE_DATE_EPOCH` + `PYTHONHASHSEED=0`.
+4. Runs the binary's `--selftest` with an empty environment in a throw-away `HOME`.
+5. Writes the checksums and signatures.
 
 Two builds of the same source with the same Python and distro produce the
-**same hash**, so anyone can rebuild and compare against what you published.
-Publish `SHA256SUMS(.asc)` and your GPG key fingerprint somewhere other than the
-download itself.
+**same binary**, so anyone can rebuild and compare.
+
+### Post-quantum signing key (once)
+
+```bash
+.venv/bin/python pqsign.py keygen --out vaultterm-release   # .key (Argon2id-encrypted, keep offline) + .pub
+.venv/bin/python pqsign.py fingerprint vaultterm-release.pub
+```
+
+Publish the `.pub` and its fingerprint (and your GPG fingerprint) somewhere
+other than the download itself.
 
 ### Verify a release before running it
 
 ```bash
-./verify.sh dist/vaultterm                    # checks SHA256SUMS (+ .asc signature) next to the binary
-./verify.sh --hash <sha256-you-got-elsewhere> dist/vaultterm
-./verify.sh --source                          # the source tree vs SOURCE-SHA256SUMS(.asc)
+./verify.sh dist/vaultterm                                             # B2SUMS (+ GPG .asc if present)
+./verify.sh dist/vaultterm --pq-pub vaultterm-release.pub \
+            --pq-fingerprint "XXXX XXXX …"                             # also REQUIRE the ML-DSA-87 signature
+./verify.sh --b2 <blake2b-512-you-got-elsewhere> dist/vaultterm
+./verify.sh --source --pq-pub vaultterm-release.pub
 ```
 
-Or by hand with nothing but coreutils and gpg:
-
-```bash
-gpg --verify SHA256SUMS.asc SHA256SUMS && sha256sum -c SHA256SUMS
-```
+By hand: `b2sum -c B2SUMS`, `gpg --verify B2SUMS.asc B2SUMS`, and
+`python3 pqsign.py verify --pub vaultterm-release.pub B2SUMS`.
 
 ### Command line
 
 ```
-vaultterm                      normal start (initialise or unlock)
+vaultterm                      initialise or unlock
+vaultterm --keyfile PATH       default keyfile path to offer (also $VAULTTERM_KEYFILE)
 vaultterm --restore FILE       install a .vtbak backup as the active vault
 vaultterm --recover            open the vault with paper recovery shares
 vaultterm --selftest           built-in crypto/format tests in a temp dir
 vaultterm --version
 ```
 
-`VAULTTERM_DIR=/path` uses another vault folder (default `~/.vaultterm`).
+`VAULTTERM_DIR` changes the vault folder (default `~/.vaultterm`);
+`VAULTTERM_STATE_DIR` changes where rollback records live (default
+`$XDG_CONFIG_HOME/vaultterm`).
 
 ---
 
@@ -215,9 +230,10 @@ vaultterm --version
 
 ### First run
 
-You set a **master password** (≥ 12 chars; the estimator asks for confirmation
-below ~60 bits) and a **deadman password**, which must be different. You can
-create a paper recovery kit right away or later.
+1. Set a **master password**: at least 12 characters, with a confirmation prompt if it estimates below 80 bits.
+2. Set a **deadman password**, which must be different.
+3. Optionally add a **keyfile**: VaultTerm can generate one (64 random bytes, mode 0400) or use an existing file.
+4. Optionally print a **paper recovery kit**. This is recommended when you use a keyfile.
 
 ### Menu
 
@@ -229,7 +245,7 @@ create a paper recovery kit right away or later.
 [5]  PURGE     delete an entry (its attachment is shredded)
 [6]  GENERATE  password / PIN / passphrase generator
 [7]  LOG       tamper-evident audit trail and error details
-[8]  REKEY     master/deadman password, KDF upgrade
+[8]  REKEY     master/deadman password, keyfile, KDF upgrade
 [9]  CLONE     backups: create, verify, restore, shred
 [10] TOTP      live TOTP code display
 [11] HEALTH    vault health check
@@ -239,87 +255,74 @@ create a paper recovery kit right away or later.
 ```
 
 From LIST/SEARCH: `[C]` copy password, `[V]` view, `[U]` update password,
-`[T]` live TOTP, `[X]` export a secret-key file. Ctrl+C cancels the current
-command. At the main menu, Ctrl+C locks and exits.
+`[T]` live TOTP, `[X]` export a secret-key file.
 
 ### Entry types
 
 | Type | Value | Generator |
 |---|---|---|
-| password | any text (warning under 12 chars) | 16–128 chars, profiles: high entropy / max compatibility / no symbols |
+| password | any text (warning under 12 chars) | 16–128 chars: high entropy / max compatibility / no symbols |
 | PIN | digits | 4–12 digits |
-| passphrase | words | 5–12 EFF words (default 6 ≈ 78 bits) |
-| secret key | an **encrypted copy of a file** + optional password (e.g. the key's own passphrase) | — |
+| passphrase | words | 5–12 EFF words (default 7 ≈ 90 bits) |
+| secret key | an **encrypted copy of a file** (≤ 64 MiB) + optional password | — |
 
-**Secret keys**: give the file path (up to 64 MiB). VaultTerm encrypts a copy,
-shows its SHA-256, and asks whether to delete the original (overwrite + unlink,
-with the SSD caveat). `[V]` can print small text files on screen; `[X]` exports
-the file back (mode 0600, hash-checked). The exported copy is *not* encrypted,
-so shred it when you're done.
+**Secret keys:**
 
-Each entry also has an optional URL, login, notes and TOTP secret. When you set
-a value, VaultTerm warns if the entry used it before (per-entry keyed history,
-last 24) or if another entry uses the same value.
+* VaultTerm encrypts a copy of the file and shows its BLAKE2b-512, so you can compare it with `b2sum`.
+* It then offers to delete the original.
+* `[V]` can show small text files on screen, and `[X]` exports the file back (mode 0600, hash-checked).
 
 ### TOTP
 
-Paste the base32 secret (input hidden). VaultTerm shows the current code so you
-can compare it with your phone before saving. Standard TOTP only (SHA-1, 6
-digits, 30 s), RFC 6238 test vectors pass. `[10]` shows a live countdown; in the
-last 5 seconds it also shows the next code.
+1. Paste the base32 secret (input hidden).
+2. Pick the algorithm: **SHA-1** (most sites; the default), SHA-256 or SHA-512. The site decides which; its setup page or the `otpauth://` link says `algorithm=` when it isn't SHA-1.
+3. VaultTerm shows the current code and asks whether it matches the site or your phone. If not, pick another algorithm.
 
-### Expiry
-
-Advisory: an entry is flagged `[EXPIRED]` when its secret (password or file)
-hasn't changed for `expiry_days`. Editing other fields doesn't reset the clock.
-
-### Backups — `[9] CLONE`
-
-* **New** writes `backups/vaultterm_<date>_<label>.vtbak` (tar of `vault.vt` + attachments, mode 0600, metadata zeroed) and then **fully verifies** it: header, key unwrap, payload authentication, every attachment's hash and decryption.
-* **Verify** repeats that check on any backup. Backups on an older password ask for that password.
-* **Restore** verifies, backs up the current vault, installs the backup, and continues unlocked with the backup's password.
-* **Shred** deletes a backup.
-* After every **rekey**, backups made since the previous rekey are re-encrypted to the new password. Older ones are listed and you can shred them.
-
-Copy `.vtbak` files to another disk yourself: the backup folder lives next to
-the vault and the deadman password destroys it too.
-
-From the command line (for example when the vault file is gone):
-`./start.sh --restore backup.vtbak`. Any existing vault files are archived
-first as `..._pre-restore-unverified.vtbak`.
+MODIFY can change the secret, change only the algorithm, or clear TOTP.
 
 ### REKEY — `[8]`
 
-1. **Change master password**: creates a verified safety backup, rotates the data key, re-encrypts the vault and every attachment under the recommended KDF parameters, commits with one atomic rename, then converts backups. If anything fails before the commit, the vault is unchanged and the message says so. If something fails after it, the message says exactly that.
-2. **Change deadman password**, which also upgrades its KDF parameters.
-3. **Upgrade KDF / rotate data key** keeping the same password.
+Every option asks for the current master password, and every key change makes
+a verified backup first.
+
+1. **Change master password**: rotates the data key, re-encrypts everything, commits atomically, then re-encrypts backups.
+2. **Change deadman password** (also upgrades its KDF parameters).
+3. **Upgrade KDF / rotate data key**, keeping the same password.
+4. **Add / replace keyfile.**
+5. **Remove the keyfile requirement.**
+
+### Backups — `[9] CLONE`
+
+* **New** creates a backup and fully verifies it: header, key unwrap, payload authentication, and every attachment.
+* **Verify** repeats that check on any backup.
+* **Restore** backs up the current vault, installs the chosen backup and keeps the generation counter monotonic.
+* **Shred** deletes a backup.
+* After a rekey, backups made since the previous rekey are re-encrypted to the new credentials. Older ones are listed and you can shred them.
+* From the command line: `./start.sh --restore backup.vtbak`.
+
+Copy backups to another disk yourself.
 
 ### Paper recovery kit — `[13] RECOVERY` (optional)
 
-Pick *n* shares and a threshold *k* (default 2 of 3). VaultTerm creates a random
-256-bit recovery key, wraps the data key with it, splits it with Shamir's
-secret sharing over GF(256), and writes a printable PDF with one page per share.
-Each page has the share as text (base32 groups with a checksum that catches
-typos) plus a QR code of the same text, for a keyboard-style barcode scanner.
-
-* The PDF goes to `/dev/shm` (RAM) by default. Print it, then let VaultTerm shred it.
-* Fewer than *k* shares reveal nothing. *k* shares open the vault **without** the master password, so keep each sheet in a different place.
-* Shares stay valid across master-password changes. Generating a new kit or revoking it invalidates every old sheet.
-* To use it: `./start.sh --recover`, type *k* shares, set a new master password (this rekeys). Consider generating a new kit afterwards.
+* A random 256-bit recovery key is split *k*-of-*n* with Shamir's secret sharing.
+* VaultTerm writes a PDF with one page per share: base32 text with a BLAKE2b checksum, plus a QR code. The PDF goes to `/dev/shm` by default; print it, then let VaultTerm shred it.
+* *k* shares open the vault **without** the master password or keyfile. Fewer reveal nothing.
+* Shares stay valid across password and keyfile changes. Generating a new kit or revoking it invalidates every old sheet.
+* To use it: `./start.sh --recover`, type *k* shares, then set a new master password (and optionally a keyfile).
 
 ### LOG — `[7]`
 
-Every action (unlock, add, edit, purge, rekey, backup, restore, settings,
-failed unlocks, errors, cleanups) is appended to an HMAC-chained log inside the
-encrypted vault (last 2,000 events). The screen shows whether the chain
-verifies. Errors appear on screen as `[ERR] <TYPE> <generic text> (ref abc123)`;
-type the ref (or the sequence number) in LOG to see the full detail.
+The log holds the last 2,000 events in a keyed-BLAKE2b hash chain inside the
+encrypted vault, and the LOG screen shows whether the chain verifies. Errors
+appear on screen as `[ERR] <TYPE> <generic text> (ref abc123)`; type the ref in
+LOG to see the details.
 
 | Error type | Meaning |
 |---|---|
-| `AUTH_FAILED` | wrong password (or a modified header) |
-| `VAULT_FORMAT` | the vault file isn't a readable v4 vault |
-| `VAULT_INTEGRITY` | authentication of the vault contents failed (corruption or tampering) |
+| `AUTH_FAILED` | wrong password / keyfile (or a modified header) |
+| `KEYFILE` | keyfile missing, unreadable, or too small |
+| `VAULT_FORMAT` | not a readable v5 vault |
+| `VAULT_INTEGRITY` | authentication of the vault contents failed |
 | `VAULT_MISSING` | vault data exists but `vault.vt` doesn't |
 | `KDF_PARAMS` | KDF parameters outside safe limits, or not enough memory |
 | `BLOB_INTEGRITY` | an attachment is missing, corrupt or swapped |
@@ -327,17 +330,22 @@ type the ref (or the sequence number) in LOG to see the full detail.
 | `RECOVERY_INVALID` | recovery shares invalid or for another kit |
 | `IO_ERROR`, `CLIPBOARD`, `INPUT`, `INTERNAL` | as named |
 
+Log events you'll see besides normal actions: `UNLOCK_FAIL`, `ROLLBACK_WARNING`,
+`ROLLBACK_ACCEPTED`, `STATE_AHEAD`, `STATE_WARNING`, `CLEANUP`.
+
 ### HEALTH — `[11]`
 
-Vault authentication, log chain, every attachment decrypted and hash-checked,
-permissions (0700/0600, owned by you), core dumps and dumpable flag, swap,
-KDF parameters (vault and deadman), recovery kit, weak (< 60 bits) / expired /
-shared passwords, backup count and age, backups on older passwords, vault
-generation.
+HEALTH checks:
+
+* vault authentication, the log chain, and the rollback record;
+* every attachment (decrypted and BLAKE2b-checked);
+* permissions;
+* core-dump and dumpable flags, and swap;
+* vault and deadman KDF parameters, the keyfile, PQ event sealing, and the recovery kit;
+* weak, expired and shared passwords;
+* backups (age, older credentials) and the generation number.
 
 ### SETTINGS — `[12]`
-
-Stored inside the encrypted vault.
 
 | Setting | Default | Range |
 |---|---|---|
@@ -351,37 +359,36 @@ Stored inside the encrypted vault.
 ## Files on disk
 
 ```
-~/.vaultterm/                 0700
-├── vault.vt                  0600   header + encrypted, padded payload
-├── blobs/<id>.blob           0600   encrypted, padded attachments
-├── backups/*.vtbak           0600   verified backups (tar)
-└── events.sealed             0600   sealed pre-unlock events (temporary)
+~/.vaultterm/                       0700
+├── vault.vt                        0600   header + encrypted, padded payload
+├── blobs/<id>.blob                 0600   encrypted, padded attachments
+├── backups/*.vtbak                 0600   verified backups (tar)
+└── events.sealed                   0600   hybrid-PQ-sealed pre-unlock events (temporary)
+~/.config/vaultterm/<id>.state      0600   rollback record (keyed BLAKE2b)
 ```
-
-Leftovers of interrupted operations (temp files, orphan blobs, half-converted
-backups) are cleaned at the next unlock and recorded in the LOG.
 
 ---
 
 ## Tests
 
 ```bash
-.venv/bin/python -m unittest discover -s tests -v       # 36 unit tests
+.venv/bin/python -m unittest discover -s tests -v                   # 48 unit tests
 .venv/bin/python vaultterm.py --selftest
-pip install pexpect && python tests/e2e_pty.py vaultterm.py       # end-to-end in a pty
-python tests/e2e_pty.py dist/vaultterm                            # same, against the binary
+pip install pexpect && python tests/e2e_pty.py vaultterm.py         # end-to-end in a pty (all scenarios)
+python tests/e2e_pty.py dist/vaultterm                              # same, against the binary
 ```
 
-The unit tests cover tamper detection (payload bit flips, header edits, KDF
-downgrade, truncated files), padding, Ctrl+C and I/O failure in the middle of a
-rekey, attachment tampering, backup convert/restore, malicious tar members
-(path traversal, symlinks), Shamir subsets, share typos, log-chain forgery,
-sealed events, TOTP vectors, generators and the estimator.
+The unit tests cover:
 
-The end-to-end test drives the real UI. It checks that auto-lock fires while
-idle at the menu, that EJECT empties the clipboard, that MODIFY never prints
-secrets, and that secret-key, rekey + backup conversion, CLI restore, paper
-recovery from the generated PDF, and deadman all work.
+* key commitment, BLAKE2b domain separation, hybrid KEM sealing;
+* tamper detection (bit flips, header edits, KDF downgrade, truncation, wrong format version);
+* rollback detection (older copy, same generation with different content, an interrupted state write, accepting, restore staying monotonic, record tampering);
+* keyfile (required, wrong file, deadman without it, add/remove, backup conversion);
+* Ctrl+C and I/O failure mid-rekey, attachment tampering, malicious tar members;
+* Shamir subsets and share typos, log-chain forgery;
+* RFC 6238 vectors for SHA-1/256/512, generators and the estimator.
+
+The end-to-end scenarios are basic, autolock, secretkey, recovery, deadman, keyfile and rollback.
 
 ---
 
@@ -391,14 +398,14 @@ Runtime (pinned with hashes in `requirements.txt`, wheels only):
 
 | Package | Why |
 |---|---|
-| `cryptography` | ChaCha20-Poly1305, Argon2id, HKDF, X25519 |
+| `cryptography` ≥ 50 | ChaCha20-Poly1305, Argon2id, HKDF-BLAKE2b, X25519, ML-KEM-1024, ML-DSA-87 |
 | `rich` (+ `markdown-it-py`, `mdurl`, `pygments`) | terminal UI |
-| `qrcode` | QR codes in the recovery PDF (optional; text-only sheets without it) |
+| `qrcode` | QR codes on the recovery PDF (optional) |
 | `cffi`, `pycparser` | required by `cryptography` |
 
-TOTP, Shamir sharing, the PDF writer and the strength estimator are implemented
-in `vaultterm.py` itself, so there are fewer third-party packages to trust.
-Build only: `pyinstaller` and its helpers (`requirements-build.txt`).
+BLAKE2b, TOTP, Shamir sharing, the PDF writer and the strength estimator use
+the Python standard library or are implemented in `vaultterm.py`. Build only:
+`pyinstaller` and helpers (`requirements-build.txt`).
 
 VaultTerm is released under The Unlicense. The EFF large wordlist
 (`vaultterm_wordlist.py`) is © Electronic Frontier Foundation, CC BY 3.0 US,

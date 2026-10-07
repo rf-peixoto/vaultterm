@@ -15,9 +15,9 @@ fi
 # attacker who can edit these files can also edit this script: authenticity
 # comes from checking the GPG signature with ./verify.sh --source BEFORE you
 # run anything (see README, "Verifying a release").
-if [[ -f "$APP_DIR/SOURCE-SHA256SUMS" ]]; then
-  if ! (cd "$APP_DIR" && sha256sum --quiet --strict -c SOURCE-SHA256SUMS); then
-    echo "[ERR] source files do not match SOURCE-SHA256SUMS. refusing to start." >&2
+if [[ -f "$APP_DIR/SOURCE-B2SUMS" ]]; then
+  if ! (cd "$APP_DIR" && b2sum --quiet --strict -c SOURCE-B2SUMS); then
+    echo "[ERR] source files do not match SOURCE-B2SUMS. refusing to start." >&2
     exit 1
   fi
 fi

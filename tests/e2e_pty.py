@@ -1,6 +1,6 @@
 """Optional end-to-end test: drives VaultTerm in a pseudo-terminal (needs `pip install pexpect`).
 
-Usage:  python tests/e2e_pty.py vaultterm.py [basic autolock secretkey recovery deadman]
+Usage:  python tests/e2e_pty.py vaultterm.py [basic autolock secretkey recovery deadman keyfile rollback]
         python tests/e2e_pty.py dist/vaultterm        (test the compiled binary)
 Uses a throw-away VAULTTERM_DIR and a fake wl-copy/wl-paste; never touches your vault.
 """
@@ -24,7 +24,7 @@ cat > "{clipfile}"
 for f in fakebin.iterdir(): f.chmod(0o755)
 
 def env(base):
-    e = dict(os.environ, VAULTTERM_DIR=str(base), NO_COLOR="1", WAYLAND_DISPLAY="fake",
+    e = dict(os.environ, VAULTTERM_DIR=str(base), VAULTTERM_STATE_DIR=str(base) + "-state", NO_COLOR="1", WAYLAND_DISPLAY="fake",
              PATH=f"{fakebin}:{os.environ['PATH']}", TERM="xterm")
     e.pop("DISPLAY", None)
     return e
@@ -46,6 +46,7 @@ def init(base):
     prompt(c, "confirm master password"); c.sendline(MASTER)
     prompt(c, "new deadman password"); c.sendline(DEAD)
     prompt(c, "confirm deadman password"); c.sendline(DEAD)
+    prompt(c, "require a keyfile"); c.sendline("n")
     c.expect("vault initialised", timeout=60)
     prompt(c, "paper recovery kit"); c.sendline("n")
     return c
@@ -79,7 +80,9 @@ if run("basic"):
     prompt(c, "login/email"); c.sendline("alice")
     prompt(c, "notes (optional)"); c.sendline("security answer: blue")
     prompt(c, "TOTP secret"); c.sendline("JBSWY3DPEHPK3PXP")
-    c.expect("TOTP validated")
+    prompt(c, "TOTP algorithm"); c.sendline("3")
+    c.expect(r"current code: \d{6} \(SHA-512\)")
+    prompt(c, "does it match"); c.sendline("y")
     prompt(c, "password mode"); c.sendline("m")
     prompt(c, "new password"); c.sendline("short1")
     prompt(c, "confirm password"); c.sendline("short1")
@@ -91,12 +94,12 @@ if run("basic"):
     menu(c, "4"); prompt(c, "entry id to modify"); c.sendline("1")
     prompt(c, "name"); c.sendline(""); prompt(c, "url"); c.sendline("-"); prompt(c, "login"); c.sendline("")
     c.expect(r"notes: \[hidden, 21 chars\]"); prompt(c, "notes: [K]eep"); c.sendline("k")
-    c.expect(r"TOTP secret: \[hidden, 16 chars\]"); prompt(c, "TOTP secret: [K]eep"); c.sendline("c")
+    c.expect(r"TOTP: \[hidden, 16 chars\] · SHA-512"); prompt(c, "TOTP: [K]eep"); c.sendline("c")
     prompt(c, "password"); c.sendline("k")
     c.expect("entry 1 modified"); seen = c.before
     prompt(c, "press ENTER"); c.sendline("")
     tr = (work / "transcript.log").read_text()
-    check("MODIFY never prints TOTP secret or notes", "JBSWY3DPEHPK3PXP" not in tr.split("TOTP validated")[1] and "blue" not in tr.split("entry injected")[1])
+    check("MODIFY never prints TOTP secret or notes", "JBSWY3DPEHPK3PXP" not in tr and "blue" not in tr.split("entry injected")[1])
     # copy to clipboard
     menu(c, "1"); prompt(c, "action"); c.sendline("c"); prompt(c, "entry id to copy"); c.sendline("1")
     c.expect("copied"); prompt(c, "press ENTER")
@@ -159,7 +162,7 @@ if run("secretkey"):
     check("original key file deleted", not keyfile.exists())
     prompt(c, "press ENTER"); c.sendline("")
     blobs = list((base / "blobs").iterdir())
-    check("one padded encrypted blob", len(blobs) == 1 and blobs[0].stat().st_size == 4096 + 28 and b"BEGIN" not in blobs[0].read_bytes())
+    check("one padded encrypted blob", len(blobs) == 1 and blobs[0].stat().st_size == 4096 + 60 and b"BEGIN" not in blobs[0].read_bytes())
     out = work / "exported.key"
     menu(c, "1"); prompt(c, "action"); c.sendline("x"); prompt(c, "secret key entry id"); c.sendline("1")
     prompt(c, "export to path"); c.sendline(str(out)); c.expect("exported to")
@@ -173,7 +176,7 @@ if run("secretkey"):
     prompt(c, "new master password"); c.sendline("Np4!xR8#kW2@zT6-second")
     prompt(c, "confirm master password"); c.sendline("Np4!xR8#kW2@zT6-second")
     prompt(c, "make a verified backup"); c.sendline("y")
-    c.expect(r"vault re-keyed\. 2 backup\(s\) now open with the new password", timeout=120)
+    c.expect(r"vault re-keyed\. 2 backup\(s\) now open with the new credentials", timeout=120)
     check("rekey converted manual + safety backups", True)
     prompt(c, "press ENTER"); c.sendline("")
     menu(c, "11"); c.expect("attachments decrypt"); c.expect("1 ok"); prompt(c, "press ENTER"); c.sendline("")
@@ -206,11 +209,11 @@ if run("recovery"):
     check("kit PDF shredded after printing", not pdfpath.exists())
     prompt(c, "press ENTER"); c.sendline("")
     menu(c, "0"); c.expect(pexpect.EOF)
-    lines = re.findall(rb"\((VT4-[A-Z2-7-]+|[A-Z2-7]{4}(?:-[A-Z2-7]{4}){0,3})\) Tj", pdf)
+    lines = re.findall(rb"\((VT5-[A-Z2-7-]+|[A-Z2-7]{4}(?:-[A-Z2-7]{4}){0,3})\) Tj", pdf)
     shares, cur = [], None
     for l in lines:
         l = l.decode()
-        if l.startswith("VT4-"):
+        if l.startswith("VT5-"):
             cur = [l]; shares.append(cur)
         else:
             cur.append(l)
@@ -223,6 +226,7 @@ if run("recovery"):
     c.expect("vault opened with the recovery kit", timeout=60)
     prompt(c, "new master password"); c.sendline("Hb3!yQ7#fM5@jK1-third")
     prompt(c, "confirm master password"); c.sendline("Hb3!yQ7#fM5@jK1-third")
+    prompt(c, "require a keyfile from now on"); c.sendline("n")
     c.expect("vault re-keyed", timeout=120)
     check("paper recovery + forced new master password", True)
     prompt(c, "press ENTER"); c.sendline("")
@@ -242,6 +246,71 @@ if run("deadman"):
     c.expect("VAULT_INTEGRITY", timeout=60); c.expect("reinstall VaultTerm"); c.expect(pexpect.EOF)
     check("deadman: generic corruption message", True)
     check("deadman: vault dir and backups gone", not base.exists())
+
+# ── scenario 6: keyfile second factor ───────────────────────────────────────
+if run("keyfile"):
+    base = work / "v7"
+    kf = work / "usb.key"
+    c = init(base)
+    menu(c, "8"); prompt(c, "option"); c.sendline("4")
+    prompt(c, "current master password"); c.sendline(MASTER)
+    prompt(c, "keyfile"); c.sendline("1")
+    prompt(c, "where to create it"); c.sendline(str(kf)); c.expect("keyfile created")
+    prompt(c, "make a verified backup"); c.sendline("y")
+    c.expect(r"vault re-keyed", timeout=120)
+    check("keyfile created with mode 0400", (kf.stat().st_mode & 0o777) == 0o400)
+    prompt(c, "press ENTER"); c.sendline("")
+    menu(c, "0"); c.expect(pexpect.EOF)
+    c = spawn(base)
+    c.expect("keyfile required")
+    prompt(c, "master password"); c.sendline(MASTER)
+    prompt(c, "keyfile path"); c.sendline(str(work / "missing.key"))
+    c.expect("KEYFILE", timeout=60)
+    check("unlock refused without the keyfile", True)
+    prompt(c, "master password"); c.sendline(MASTER)
+    prompt(c, "keyfile path"); c.sendline(str(kf))
+    c.expect("access granted", timeout=60); prompt(c, "press ENTER"); c.sendline("")
+    check("unlock works with password + keyfile", True)
+    menu(c, "0"); c.expect(pexpect.EOF)
+    c = spawn(base)
+    prompt(c, "master password"); c.sendline(DEAD)
+    prompt(c, "keyfile path"); c.sendline("")
+    c.expect("VAULT_INTEGRITY", timeout=60); c.expect(pexpect.EOF)
+    check("deadman works without the keyfile", not base.exists())
+
+# ── scenario 7: rollback detection ──────────────────────────────────────────
+if run("rollback"):
+    base = work / "v8"
+    c = init(base)
+    menu(c, "0"); c.expect(pexpect.EOF)
+    old = (base / "vault.vt").read_bytes()
+    c = spawn(base); unlock(c)
+    menu(c, "12")
+    prompt(c, "expiry_days"); c.sendline("")
+    prompt(c, "auto_lock_minutes"); c.sendline("")
+    prompt(c, "enable clipboard"); c.sendline("n")
+    c.expect("settings saved"); prompt(c, "press ENTER"); c.sendline("")
+    menu(c, "0"); c.expect(pexpect.EOF)
+    (base / "vault.vt").write_bytes(old)          # attacker puts back an older copy
+    c = spawn(base)
+    prompt(c, "master password"); c.sendline(MASTER)
+    c.expect("ROLLBACK DETECTED", timeout=60)
+    prompt(c, "did YOU restore"); c.sendline("n")
+    c.expect("will repeat at every unlock")
+    prompt(c, "press ENTER"); c.sendline("")
+    menu(c, "0"); c.expect(pexpect.EOF)
+    c = spawn(base)
+    prompt(c, "master password"); c.sendline(MASTER)
+    c.expect("ROLLBACK DETECTED", timeout=60)
+    check("rollback warning persists across sessions", True)
+    prompt(c, "did YOU restore"); c.sendline("y"); c.expect("accepted")
+    prompt(c, "press ENTER"); c.sendline("")
+    menu(c, "0"); c.expect(pexpect.EOF)
+    c = spawn(base)
+    prompt(c, "master password"); c.sendline(MASTER)
+    idx = c.expect(["ROLLBACK DETECTED", "press ENTER"], timeout=60)
+    check("accepted rollback no longer warns", idx == 1)
+    c.sendline(""); menu(c, "0"); c.expect(pexpect.EOF)
 
 print(f"\n{sum(ok for _, ok in results)}/{len(results)} checks passed")
 shutil.rmtree(work, ignore_errors=True)
